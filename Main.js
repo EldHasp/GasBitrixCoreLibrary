@@ -435,44 +435,66 @@ function _processCalls(config, period, updateStatus) {
  * @private
  */
 function _processLeads(config, period, allLeads, callsData, liveMap, updateStatus) {
-  // 1. Сначала строим карту связей Контакт -> Лиды (мы её уже оптимизировали)
+  // 1. Аналитика связей
   const contactToLeadsMap = GetContactToLeadsMap(allLeads);
-  updateStatus(`🔗 Карта связей построена для ${Object.keys(contactToLeadsMap).length} контактов.`);
-
-  // 2. Строим индекс первых звонков для ЛИДОВ
-  const firstCallsMap = _buildLeadFirstCallsMap(callsData, contactToLeadsMap);
   
-  const connectionsCount = Object.keys(firstCallsMap).length;
-  updateStatus(`🔍 Аналитика: Итоговый индекс содержит ${connectionsCount} лидов со звонками.`);
+  const contactsFound = Object.keys(contactToLeadsMap).length;
+  updateStatus(`🔗 Контактов в базе лидов: ${contactsFound}`);
+  
+  // 2. Строим индекс первых звонков
+  const callsIndex = _buildLeadFirstCallsMap(callsData, contactToLeadsMap);
 
-  // 3. РАСЧЕТ DATECOLS (Добавьте это прямо здесь)
+  // 3. Сопоставляем звонки ТОЛЬКО для лидов, созданных в период отчета
+  const firstCallsMap = {};
+  const reportStartMs = new Date(period.start).getTime();
+
+  allLeads.forEach(lead => {
+    const leadCreatedMs = new Date(lead.DATE_CREATE).getTime();
+
+    // ПРОВЕРКА: Проставляем аналитику только если лид "свежий"
+    if (leadCreatedMs >= reportStartMs) {
+      const leadId = String(lead.ID);
+      if (callsIndex[leadId]) {
+        firstCallsMap[leadId] = callsIndex[leadId];
+      }
+    }
+  });
+
+  // 4. Подготовка заголовков и маппингов
   const finalHeaders = [...config.requiredHeaders, "Дата первого звонка", "Скорость реакции (сек)"];
-  const dateCols = finalHeaders.map((h, i) => 
-    (liveMap[h]?.type === 'datetime' || liveMap[h]?.type === 'date' || h === "Дата первого звонка") ? i + 1 : null
-  ).filter(i => i);
-
-  // 4. Формируем заголовки и карты для записи
-
+  
+  // ИСПРАВЛЕНО: Используем let, чтобы можно было создать лист, если его нет
   let targetSheet = config.ss.getSheetByName(config.leadsSheet);
-
   if (!targetSheet) {
     updateStatus(`⚠️ Лист "${config.leadsSheet}" не найден. Создаю новый...`);
     targetSheet = config.ss.insertSheet(config.leadsSheet);
   }
 
-  // 5. Подготовка карт для записи
   const maps = {
     "ASSIGNED_BY_ID": GetUsersMap(allLeads.map(l => l.ASSIGNED_BY_ID)),
     "SOURCE_ID": GetSourcesMap(allLeads.map(l => l.SOURCE_ID)),
     "UF_CRM_1675850186": GetOfficesMap(allLeads.map(l => l.UF_CRM_1675850186)),
-    "FIRST_CALL_DATE": firstCallsMap // Передаем нашу "чистую" карту
+    "FIRST_CALL_DATE": firstCallsMap
   };
+
+  // 5. Расчет индексов колонок с датами
+  const dateCols = finalHeaders.map((h, i) => 
+    (liveMap[h]?.type === 'datetime' || liveMap[h]?.type === 'date' || h === "Дата первого звонка") ? i + 1 : null
+  ).filter(i => i);
+
+  // 6. Физическая запись
+  updateStatus(`✍️ Запись ${allLeads.length} лидов...`);
+  updateStatus(`📈 Лидов ${allLeads.length}; Звонков ${callsData.length}`);
+  
+  const connectionsFound = Object.keys(firstCallsMap).length;
+  updateStatus(`🔍 Связей Лид-Звонок в памяти: ${connectionsFound}`);
 
   PrepareLeadsSheet(targetSheet, finalHeaders);
   BtxWriteDataToSheet(targetSheet, allLeads, finalHeaders, liveMap, maps, dateCols, 'lead');
   
   return maps; 
 }
+
 
 
 /**
@@ -550,6 +572,12 @@ function _buildLeadFirstCallsMap(callsData, contactToLeadsMap) {
     if (call.TYPE === "входящий" && !(call.STATUS == "Успешный звонок" || call.STATUS == "✅ Успешно" )) {
       skippedCount++;
       return; 
+    }
+
+        // 2. Отсекаем ВСЁ, что имеет статус "⏳ Пропущен" или "❌ Отменено"
+    if (call.STATUS.includes("Пропущен") || call.STATUS.includes("Отменен")) {
+      skippedCount++;
+      return;
     }
     // -----------------------
 
