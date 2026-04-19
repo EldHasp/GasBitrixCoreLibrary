@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <base target="_top">
+    <style>
+      body { font-family: 'Segoe UI', sans-serif; background-color: #f8f9fa; margin: 0; padding: 15px; overflow: hidden; }
+      .container { display: flex; align-items: flex-start; gap: 15px; }
+      
+      /* Лоадер слева */
+      .loader { 
+        border: 3px solid #f3f3f3; border-top: 3px solid #4285f4; 
+        border-radius: 50%; width: 30px; height: 30px; 
+        animation: spin 1s linear infinite; flex-shrink: 0;
+      }
+      
+      /* Лог справа - ОБНОВЛЕННЫЙ */
+      #log-container { 
+        flex-grow: 1; 
+        font-size: 11px; 
+        color: #333; 
+        text-align: left; 
+        max-height: 460px; /* Увеличили высоту прокрутки */
+        overflow-y: auto; 
+        /* КРИТИЧНО: сохраняем переносы строк \n из нашего лога */
+        white-space: pre-wrap; 
+        word-wrap: break-word;
+        line-height: 1.4;
+      }
+
+      @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <div class="loader" id="spinner"></div>
+      <div id="log-container">Инициализация...</div>
+    </div>
+ 
+<script>
+  // 1. Сразу при открытии ставим статус ожидания
+  document.getElementById('log-container').innerText = "🚀 Запуск...";
+
+  const poll = setInterval(function() {
+    google.script.run.withSuccessHandler(function(statusText) {
+      // Если данных в кэше еще нет, ничего не делаем
+      if (!statusText || statusText === "Подготовка...") {
+        return; 
+      }
+      
+      var logContainer = document.getElementById('log-container');
+      if (logContainer) {
+        logContainer.innerText = statusText;
+        // Прокрутка вниз к последнему сообщению
+        logContainer.scrollTop = logContainer.scrollHeight;
+      }
+
+      // 3. ПРОВЕРКА ЗАВЕРШЕНИЯ (🏆 - успех, ❌ - ошибка, ⚠️ - предупреждение)
+      if (/[🏆❌⚠️]/.test(statusText)) {
+        // Останавливаем опрос сервера (квоты Google не бесконечны)
+        clearInterval(poll);
+        
+        // Скрываем синий лоадер (спиннер)
+        var spinner = document.getElementById('spinner');
+        if (spinner) {
+          spinner.style.display = 'none'; 
+        }
+      }
+    }).getProcessingStatus(); 
+  }, 500); // Опрос раз в 1.5 секунды
+</script>
+
+
+ </body>
+</html>
