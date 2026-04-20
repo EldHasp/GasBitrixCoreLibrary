@@ -249,6 +249,7 @@ function GetSourcesMap(sourceIds = []) {
  * @return {Object[]} Массив уникальных объектов лидов.
  */
 function GetLeadsByFiltersMap(period, headers, liveMap, filterableHeaders) {
+  updateStatus(`Загрузка периода ${period}`);
   const allLeads = [];
   const collectedIds = new Set();
   
@@ -261,6 +262,7 @@ function GetLeadsByFiltersMap(period, headers, liveMap, filterableHeaders) {
   const finalSelect = [...new Set([...selectFields, ...essentialIds])];
 
   filterableHeaders.forEach(headerName => {
+    updateStatus(`Загрузка ${headerName}`);
     const fieldInfo = liveMap[headerName];
     if (!fieldInfo) return;
 
@@ -317,6 +319,7 @@ function GetLeadsByFiltersMap(period, headers, liveMap, filterableHeaders) {
         }
       }
       currentStart += (commandsCount * 50);
+      updateStatus(`Загружено лидов: ${currentStart.length}`);
     }
   });
 

@@ -40,6 +40,7 @@ function ExportLeadsToSheet(ss, isManual = false) {
 
   CacheService.getUserCache().remove('status_log');
   SpreadsheetApp.flush();
+  
   if (isManual) {
     updateStatus("⚙️ Инициализация..."); 
     const html = HtmlService.createHtmlOutputFromFile('Progress').setWidth(350).setHeight(500);
@@ -56,7 +57,11 @@ function ExportLeadsToSheet(ss, isManual = false) {
     // 1. Сбор лидов
     updateStatus("🛰 Загрузка лидов из Битрикс24...");
     const allLeads = GetLeadsByFiltersMap(period, config.requiredHeaders, liveMap, config.filterableHeaders);
-    if (!allLeads || allLeads.length === 0) return updateStatus("⚠️ Лиды за период не найдены.");
+    if (!allLeads || allLeads.length === 0)
+    {
+       updateStatus("⚠️ Лиды за период не найдены.");
+       return;
+    }
 
     // 2. Обработка звонков (Модуль 2)
     const callsData = _processCalls(config, period, updateStatus);
@@ -560,48 +565,43 @@ function _buildLeadFirstCallsMap(callsData, contactToLeadsMap) {
   callsData.forEach(call => {
     if (!call.CRM || !call.DATE) return;
 
-    // --- ЦИФРОВОЕ СИТО (БЕЗОПАСНОЕ) ---
+    const statusCode = String(call.RAW_STATUS);
+
+    // --- 1. СИТО В САМОМ ВЕРХУ (ОБЩЕЕ ДЛЯ ВСЕХ) ---
+    // Если звонок плохой, мы ВООБЩЕ не смотрим, Лид это или Контакт.
+    if (["304", "603", "603-S"].includes(statusCode)) {
+      skippedCount++;
+      return;
+    }
     
-    const statusCode = call.RAW_STATUS;
-
-    // 1. Исключаем все варианты "Пропущенных"
-    // 304 - Пропущен (Canceled / Skipped)
-    if (statusCode === "304") {
+    // Фильтр системных роботов
+    if (call.USER.indexOf('Система') !== -1 || call.TYPE === "информационный") {
       skippedCount++;
       return;
     }
 
-    // 2. Исключаем роботов
-    if (call.TYPE === "информационный" || call.USER.indexOf('Система') !== -1) {
-      skippedCount++;
-      return;
-    }
-
-    // 3. ВХОДЯЩИЕ: Считаем только УСПЕХ (Код 200)
+    // Входящие: только успех
     if (call.TYPE === "входящий" && statusCode !== "200") {
       skippedCount++;
       return;
     }
 
-    // 4. ИСХОДЯЩИЕ: Пропускаем всё (кроме 304/603-S, которые мы отсекли в п.1)
-    // Любой другой код исходящего (486-Занято, 480-Вне зоны) — это РЕАКЦИЯ менеджера.
-    // ----------------------------------
-
-
+    // --- 2. РАСПРЕДЕЛЕНИЕ (КОГДА ОЧИСТКА ПРОЙДЕНА) ---
     const parts = call.CRM.split(': ');
     const type = parts[0];
     const id = parts[1];
 
     if (type === 'LEAD') {
-      updateLead(id, call.DATE);
+      updateIndex(id, call.DATE);
     } 
     else if (type === 'CONTACT') {
       const relatedLeads = contactToLeadsMap[id];
-      if (relatedLeads && relatedLeads.length > 0) {
-        relatedLeads.forEach(leadId => updateLead(leadId, call.DATE));
+      if (relatedLeads) {
+        relatedLeads.forEach(lId => updateIndex(lId, call.DATE));
       }
     }
   });
+
 
   updateStatus(`🧹 Очистка: Пропущено ${skippedCount} технических/неуспешных звонков.`);
   return leadCallsIndex;
