@@ -560,26 +560,33 @@ function _buildLeadFirstCallsMap(callsData, contactToLeadsMap) {
   callsData.forEach(call => {
     if (!call.CRM || !call.DATE) return;
 
-    // --- БЛОК ФИЛЬТРАЦИИ ---
-    // 1. Исключаем информационные звонки
-    if (call.TYPE === "информационный") { skippedCount++; return; }
+    // --- ЦИФРОВОЕ СИТО (БЕЗОПАСНОЕ) ---
     
-    // 2. Исключаем звонки системы (роботов)
-    if (call.USER === "🤖 Система" || call.USER === "Система") { skippedCount++; return; }
-    
-    // 3. Исключаем неуспешные ВХОДЯЩИЕ (пропущенные не считаются реакцией)
-    // В PreparedCall поле TYPE содержит "входящий", а STATUS содержит текст ошибки
-    if (call.TYPE === "входящий" && !(call.STATUS == "Успешный звонок" || call.STATUS == "✅ Успешно" )) {
-      skippedCount++;
-      return; 
-    }
+    const statusCode = call.RAW_STATUS;
 
-        // 2. Отсекаем ВСЁ, что имеет статус "⏳ Пропущен" или "❌ Отменено"
-    if (call.STATUS.includes("Пропущен") || call.STATUS.includes("Отменен")) {
+    // 1. Исключаем все варианты "Пропущенных"
+    // 304 - Пропущен (Canceled / Skipped)
+    if (statusCode === "304") {
       skippedCount++;
       return;
     }
-    // -----------------------
+
+    // 2. Исключаем роботов
+    if (call.TYPE === "информационный" || call.USER.indexOf('Система') !== -1) {
+      skippedCount++;
+      return;
+    }
+
+    // 3. ВХОДЯЩИЕ: Считаем только УСПЕХ (Код 200)
+    if (call.TYPE === "входящий" && statusCode !== "200") {
+      skippedCount++;
+      return;
+    }
+
+    // 4. ИСХОДЯЩИЕ: Пропускаем всё (кроме 304/603-S, которые мы отсекли в п.1)
+    // Любой другой код исходящего (486-Занято, 480-Вне зоны) — это РЕАКЦИЯ менеджера.
+    // ----------------------------------
+
 
     const parts = call.CRM.split(': ');
     const type = parts[0];

@@ -57,26 +57,37 @@ function GetDynamicMap(fieldType, fieldId) {
 
 
 /**
- * Получает маппинг полей напрямую из API.
- * @returns {Object<string, {id: string, type: string}>}
+ * Получает маппинг полей напрямую из API Битрикс24 (без использования листа).
+ * @return {Object} - { "Название RU": {id: "TECH_ID", type: "type"}, ... }
  */
 function GetLiveFieldsMap() {
+    console.log("📡 Запрос структуры полей напрямую из CRM...");
     const response = CallBitrix('crm.lead.fields', {});
     const allFields = response.result;
-    if (!allFields) throw new Error("❌ Ошибка API: структура полей не получена.");
 
-    return Object.keys(allFields).reduce((liveMap, key) => {
+    if (!allFields) throw new Error("❌ Не удалось получить структуру полей из API.");
+
+    const liveMap = {};
+    Object.keys(allFields).forEach(key => {
         const f = allFields[key];
-        // Логика именования: приоритет на человеческое название
-        const russianName = f.title || f.formLabel || f.listLabel || key;
-        
+        // Используем ту же логику приоритетов, что мы отладили для GetFieldsInfo
+        let russianName = "";
+        if (key.indexOf('UF_CRM_') === 0) {
+            russianName = f.listLabel || f.formLabel || f.filterLabel || key;
+        } else {
+            russianName = f.title || key;
+        }
+
+        // Создаем расширенный объект данных
         liveMap[russianName.toString()] = {
             id: key,
             type: f.type
         };
-        return liveMap;
-    }, {});
+    });
+
+    return liveMap;
 }
+
 
 
 /**
@@ -160,4 +171,340 @@ function GetUsersMap(userIds = []) {
     });
 
     return usersMap;
+}
+
+/**
+ * ПОЛУЧЕНИЕ КОЛЛЕКЦИИ ОФИСОВ (Инфоблок 128)
+ * Возвращает объект { "109734": "Офис Москва", ... }
+ * Проблемы и пути решения в комментарии метода GetOfficesReference
+ */
+function GetOfficesMap(officeIds = []) {
+    const params = { IBLOCK_TYPE_ID: 'lists', IBLOCK_ID: 128 };
+
+    if (officeIds && officeIds.length > 0) {
+        params['filter'] = { "ID": [...new Set(officeIds)].filter(id => id) };
+    }
+
+    const response = CallBitrix('lists.element.get', params);
+    const elements = response.result || [];
+
+    return elements.reduce((map, el) => {
+        map[el.ID.toString()] = el.NAME;
+        return map;
+    }, {});
+}
+
+/**
+ * ПОЛУЧЕНИЕ КОЛЛЕКЦИИ ИСТОЧНИКОВ
+ * @return {Object} - { "WEB": "Сайт", "PHONE": "Звонок" }
+ */
+function GetSourcesMap(sourceIds = []) {
+    const response = CallBitrix('crm.status.list', {
+        filter: { "ENTITY_ID": "SOURCE" }
+    });
+
+    const statuses = response.result || [];
+    const filterIds = (sourceIds && sourceIds.length > 0) ? sourceIds.map(String) : null;
+
+    return statuses.reduce((map, st) => {
+        if (filterIds && !filterIds.includes(st.STATUS_ID.toString())) return map;
+        map[st.STATUS_ID.toString()] = st.NAME;
+        return map;
+    }, {});
+}
+
+
+
+/**
+ * КОМБИНИРОВАННЫЙ СБОР ЛИДОВ ПО НЕСКОЛЬКИМ ФИЛЬТРАМ (С ПОДДЕРЖКОЙ OR-ЛОГИКИ И BATCH)
+ *
+ * Метод реализует сбор уникальных лидов, попадающих под условия разных полей дат
+ * (например, "Дата создания" ИЛИ "Дата квалификации"), исключая дублирование записей.
+ *
+ * 📔 ИСТОРИЯ РЕШЕНИЙ И ОПТИМИЗАЦИЙ:
+ *
+ * 1. Реализация логики "ИЛИ" (OR) в REST API:
+ * - Проблема: Стандартный фильтр Битрикс24 работает по логике "И" (AND). Нельзя
+ * одним запросом найти лиды, созданные ИЛИ квалифицированные в период.
+ * - Решение: Последовательный перебор полей из FILTERABLE_HEADERS. Скрипт делает
+ * отдельные проходы для каждого поля и объединяет результаты.
+ *
+ * 2. Использование структуры Set для дедупликации:
+ * - Проблема: Метод [].includes() при проверке 17 000+ ID начинает существенно
+ * замедлять выполнение (сложность O(n^2)).
+ * - Решение: Использование объекта new Set(). Проверка наличия ID (метод .has)
+ * выполняется за константное время O(1), что критично для больших выгрузок.
+ *
+ * 3. Агрегированное логирование:
+ * - Решение: Внедрение компактного лога "Всего | Новых | Дублей". Это позволяет
+ * визуально оценить пересечение выборок и эффективность каждого фильтра.
+ *
+ * 4. Инкапсуляция Batch-логики:
+ * - Решение: Метод берет на себя всю работу с циклами while и пакетами по 50 команд,
+ * возвращая в Main.gs уже "чистый" и расшифрованный массив объектов.
+ *
+ * @param {Object} period - Объект {start: "ISO", end: "ISO"}.
+ * @param {string[]} headers - Массив уникальных заголовков таблицы.
+ * @param {Object} liveMap - Живая карта полей из API.
+ * @return {Object[]} Массив уникальных объектов лидов.
+ */
+function GetLeadsByFiltersMap(period, headers, liveMap, filterableHeaders) {
+  const allLeads = [];
+  const collectedIds = new Set();
+  
+  // 1. ПРИНУДИТЕЛЬНО ДОБАВЛЯЕМ ТЕХНИЧЕСКИЕ ПОЛЯ В SELECT
+  // Нам нужны ID, CONTACT_ID, CONTACT_IDS и DATE_CREATE (для скорости реакции)
+  const essentialIds = ["ID", "CONTACT_ID", "CONTACT_IDS", "DATE_CREATE"];
+  const selectFields = headers.map(h => liveMap[h]?.id).filter(id => id);
+  
+  // Объединяем визуальные поля с техническими, убирая дубли
+  const finalSelect = [...new Set([...selectFields, ...essentialIds])];
+
+  filterableHeaders.forEach(headerName => {
+    const fieldInfo = liveMap[headerName];
+    if (!fieldInfo) return;
+
+    const filterFieldId = fieldInfo.id;
+    const filter = {
+      [`>=${filterFieldId}`]: period.start,
+      [`<${filterFieldId}`]: period.end
+    };
+
+    let currentStart = 0;
+    const probe = CallBitrix('crm.lead.list', { filter: filter, select: ["ID"], limit: 1 });
+    const totalForFilter = probe.total || 0;
+
+    if (totalForFilter === 0) return;
+
+    while (currentStart < totalForFilter) {
+      const cmd = {};
+      let remaining = totalForFilter - currentStart;
+      let commandsCount = Math.min(50, Math.ceil(remaining / 50));
+
+      for (let i = 0; i < commandsCount; i++) {
+        cmd[`b_${i}`] = BuildBatchCmd('crm.lead.list', {
+          filter: filter,
+          order: { "ID": "ASC" },
+          start: currentStart + (i * 50),
+          select: finalSelect // ✅ Используем расширенный список полей
+        });
+      }
+
+      const response = CallBitrix('batch', { halt: 0, cmd: cmd });
+      const results = response.result.result;
+
+      for (let key in results) {
+        if (results[key]) {
+          const batchLeads = results[key];
+
+          batchLeads.forEach(lead => {
+            if (!collectedIds.has(lead.ID)) {
+              
+              // 2. ФОРМИРУЕМ ВИРТУАЛЬНОЕ ПОЛЕ ALL_CONTACT_IDS
+              const contactSet = new Set();
+              if (lead.CONTACT_ID && lead.CONTACT_ID !== "0") contactSet.add(String(lead.CONTACT_ID));
+              if (Array.isArray(lead.CONTACT_IDS)) {
+                lead.CONTACT_IDS.forEach(id => { if (id && id !== "0") contactSet.add(String(id)); });
+              }
+              
+              // Добавляем массив всех контактов прямо в объект лида
+              lead.ALL_CONTACT_IDS = Array.from(contactSet);
+
+              allLeads.push(lead);
+              collectedIds.add(lead.ID);
+            }
+          });
+        }
+      }
+      currentStart += (commandsCount * 50);
+    }
+  });
+
+  return allLeads;
+}
+
+/**
+ * Создает карту связей Лид <-> Контакт
+ * @param {Array} allLeads - Массив сырых лидов.
+ * @returns {Object} { "CONTACT_ID": ["LEAD_ID_1", "LEAD_ID_2"] }
+ */
+function GetContactToLeadsMap(allLeads) {
+  const contactToLeads = {};
+  let leadsWithContacts = 0;
+
+  allLeads.forEach(lead => {
+    const contactIds = lead.ALL_CONTACT_IDS;
+    if (contactIds && contactIds.length > 0) {
+      leadsWithContacts++;
+      contactIds.forEach(cId => {
+        if (!contactToLeads[cId]) contactToLeads[cId] = [];
+        contactToLeads[cId].push(String(lead.ID));
+      });
+    }
+  });
+
+  updateStatus(`🔗 Аналитика: Подготовлено ${leadsWithContacts} лидов для связи со звонками.`);
+  return contactToLeads;
+}
+
+
+
+/**
+ * Анализирует массив звонков и сопоставляет их с лидами (напрямую или через связанные контакты).
+ * Находит дату самого раннего звонка для каждого лида.
+ * 
+ * @param {Object[]} rawCalls - Массив сырых объектов звонков из Bitrix24 (voximplant.statistic.get).
+ * @param {Object.<string, string[]>} contactToLeadsMap - Карта связей Контакт -> [Лиды].
+ *        Пример: { "123": ["5501", "5502"], "124": ["5503"] }
+ * 
+ * @returns {Object.<string, string>} Карта первых звонков для лидов.
+ *          Ключ — ID лида, значение — ISO дата самого раннего звонка.
+ *          Пример: { "5501": "2024-10-25T14:30:05+03:00" }
+ */
+function GetLeadFirstCallMap(rawCalls, contactToLeadsMap) {
+  const leadFirstCall = {};
+
+  const updateLeadDate = (leadId, callDate) => {
+    if (!leadId) return;
+    const sId = String(leadId);
+    const newTime = new Date(callDate).getTime();
+    if (!leadFirstCall[sId] || newTime < new Date(leadFirstCall[sId]).getTime()) {
+      leadFirstCall[sId] = callDate;
+    }
+  };
+
+  rawCalls.forEach(call => {
+    // Берем данные напрямую из свойств, которые мы видим на скриншоте
+    const entityType = call.CRM_ENTITY_TYPE; // "LEAD" или "CONTACT"
+    const entityId = call.CRM_ENTITY_ID;     // "144838" (строка)
+    const callDate = call.CALL_START_DATE;
+
+    if (!entityId || entityId === "0" || !callDate) return;
+
+    if (entityType === 'LEAD') {
+      updateLeadDate(entityId, callDate);
+    } 
+    else if (entityType === 'CONTACT') {
+      const relatedLeads = contactToLeadsMap[entityId];
+      if (relatedLeads && Array.isArray(relatedLeads)) {
+        relatedLeads.forEach(lId => updateLeadDate(lId, callDate));
+      }
+    }
+  });
+  return leadFirstCall;
+}
+
+
+/**
+ * КОМБИНИРОВАННЫЙ СБОР ЛИДОВ ПО НЕСКОЛЬКИМ ФИЛЬТРАМ (С ПОДДЕРЖКОЙ OR-ЛОГИКИ И BATCH)
+ *
+ * Метод реализует сбор уникальных лидов, попадающих под условия разных полей дат
+ * (например, "Дата создания" ИЛИ "Дата квалификации"), исключая дублирование записей.
+ *
+ * 📔 ИСТОРИЯ РЕШЕНИЙ И ОПТИМИЗАЦИЙ:
+ *
+ * 1. Реализация логики "ИЛИ" (OR) в REST API:
+ * - Проблема: Стандартный фильтр Битрикс24 работает по логике "И" (AND). Нельзя
+ * одним запросом найти лиды, созданные ИЛИ квалифицированные в период.
+ * - Решение: Последовательный перебор полей из FILTERABLE_HEADERS. Скрипт делает
+ * отдельные проходы для каждого поля и объединяет результаты.
+ *
+ * 2. Использование структуры Set для дедупликации:
+ * - Проблема: Метод [].includes() при проверке 17 000+ ID начинает существенно
+ * замедлять выполнение (сложность O(n^2)).
+ * - Решение: Использование объекта new Set(). Проверка наличия ID (метод .has)
+ * выполняется за константное время O(1), что критично для больших выгрузок.
+ *
+ * 3. Агрегированное логирование:
+ * - Решение: Внедрение компактного лога "Всего | Новых | Дублей". Это позволяет
+ * визуально оценить пересечение выборок и эффективность каждого фильтра.
+ *
+ * 4. Инкапсуляция Batch-логики:
+ * - Решение: Метод берет на себя всю работу с циклами while и пакетами по 50 команд,
+ * возвращая в Main.gs уже "чистый" и расшифрованный массив объектов.
+ *
+ * @param {Object} period - Объект {start: "ISO", end: "ISO"}.
+ * @param {string[]} headers - Массив уникальных заголовков таблицы.
+ * @param {Object} liveMap - Живая карта полей из API.
+ * @return {Object[]} Массив уникальных объектов лидов.
+ */
+function GetLeadsByFiltersMap(period, headers, liveMap, filterableHeaders) {
+  const allLeads = [];
+  const collectedIds = new Set();
+  const selectFields = headers.map(h => liveMap[h]?.id).filter(id => id);
+
+  // 1. ПЕРВЫЙ ЭТАП: Забираем "Дата создания" (DATE_CREATE) как базу
+  // Предполагаем, что DATE_CREATE — это первый элемент или находим его
+  const mainHeader = filterableHeaders.find(h => liveMap[h].id === 'DATE_CREATE') || filterableHeaders[0];
+  const mainFieldId = liveMap[mainHeader].id;
+
+  console.log(`🚀 Начинаем сбор по основному полю: ${mainHeader}`);
+  
+  let start = 0;
+  let total = 1;
+  while (start < total) {
+    const res = CallBitrix('crm.lead.list', {
+      filter: { [`>=${mainFieldId}`]: period.start, [`<${mainFieldId}`]: period.end },
+      select: selectFields,
+      start: start
+    });
+    
+    if (res.result) {
+      res.result.forEach(lead => {
+        allLeads.push(lead);
+        collectedIds.add(lead.ID);
+      });
+    }
+    total = res.total || 0;
+    start += 50;
+  }
+  console.log(`✅ Основной сбор завершен: ${allLeads.length} лидов.`);
+
+  // 2. ВТОРОЙ ЭТАП: Проверяем остальные фильтры только на наличие НОВЫХ ID
+  const secondaryHeaders = filterableHeaders.filter(h => h !== mainHeader);
+  const idsToFetch = new Set();
+
+  secondaryHeaders.forEach(headerName => {
+    const fieldId = liveMap[headerName].id;
+    let sStart = 0;
+    let sTotal = 1;
+    
+    while (sStart < sTotal) {
+      const res = CallBitrix('crm.lead.list', {
+        filter: { [`>=${fieldId}`]: period.start, [`<${fieldId}`]: period.end },
+        select: ["ID"], // ТЯНЕМ ТОЛЬКО ID (это быстро!)
+        start: sStart
+      });
+      
+      if (res.result) {
+        res.result.forEach(l => {
+          if (!collectedIds.has(l.ID)) {
+            idsToFetch.add(l.ID); // Только те, кого еще нет в базе
+          }
+        });
+      }
+      sTotal = res.total || 0;
+      sStart += 50;
+    }
+  });
+
+  // 3. ТРЕТИЙ ЭТАП: Дозагрузка недостающих данных (те самые 7%)
+  if (idsToFetch.size > 0) {
+    console.log(`📡 Догружаем уникальные лиды из других фильтров: ${idsToFetch.size} шт.`);
+    const extraIds = Array.from(idsToFetch);
+    
+    // Используем Batch по 50 ID, как обсуждали ранее
+    let i = 0;
+    while (i < extraIds.length) {
+      const chunk = extraIds.slice(i, i + 50);
+      const res = CallBitrix('crm.lead.list', {
+        filter: { "@ID": chunk },
+        select: selectFields
+      });
+      if (res.result) allLeads.push(...res.result);
+      i += 50;
+    }
+  }
+
+  return allLeads;
 }
