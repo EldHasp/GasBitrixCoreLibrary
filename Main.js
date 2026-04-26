@@ -38,7 +38,7 @@
 function ExportLeadsToSheet(ss, isManual = false) {
   const startTime = new Date();
 
-  CacheService.getUserCache().remove('status_log');
+  CacheService.getUserCache().remove('status');
   SpreadsheetApp.flush();
   
   if (isManual) {
@@ -56,7 +56,7 @@ function ExportLeadsToSheet(ss, isManual = false) {
 
     // 1. Сбор лидов
     updateStatus("🛰 Загрузка лидов из Битрикс24...");
-    const allLeads = GetLeadsByFiltersMap(period, config.requiredHeaders, liveMap, config.filterableHeaders);
+    const allLeads = GetLeadsByFiltersMap(period, config.requiredHeaders, liveMap, config.filterableHeaders, updateStatus);
     if (!allLeads || allLeads.length === 0)
     {
        updateStatus("⚠️ Лиды за период не найдены.");
@@ -145,15 +145,17 @@ function updateStatus(msg) {
 
 
 /**
- * Получает текущий массив статусов (лог) из кэша для передачи в HTML-интерфейс.
- * 
- * @returns {string} Строка лога с разделителями "|" или сообщение по умолчанию.
+ * Текущий лог прогресса для UI (кэш-ключ совпадает с {@link updateStatus}).
+ * В скрипте таблицы обычно вызывают через «мост», например:
+ * `google.script.run.getProcessingStatus()` → `BitrixCore_Library.getLibraryStatus()`,
+ * как в Progress.html (опрос каждые 500 мс).
+ *
+ * @returns {string} Многострочный лог или «Подготовка...», пока экспорт не писал статус.
  */
 function getLibraryStatus() {
   try {
-    // Запрашиваем именно тот ключ, который использует новая функция updateStatus
-    const log = CacheService.getUserCache().get('status_log');
-    return log ? log : "Инициализация...";
+    const status = CacheService.getUserCache().get('status');
+    return status ? status : "Подготовка...";
   } catch (e) {
     console.error("❌ Ошибка получения статуса из кэша: " + e.message);
     return "⚠️ Ошибка кэша";
@@ -181,17 +183,66 @@ function initClient(ss) {
 
 
 /**
- * Вспомогательная функция для получения текущего статуса процесса.
- * Вызывается из HTML-интерфейса (Progress.html) методом setInterval.
- * 
- * @returns {string} Текущая строка статуса из кеша пользователя.
+ * Возвращает значение именованного диапазона или null, если диапазон не найден.
+ * Пишет диагностический лог для быстрой проверки конфигурации.
+ *
+ * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} ss
+ * @param {string} rangeName
+ * @returns {*|null}
+ * @private
  */
-function getLibraryStatus() {
-  const status = CacheService.getUserCache().get('status');
-  return status ? status : "Подготовка...";
+function _getNamedRangeValue(ss, rangeName) {
+  const namedRange = ss.getRangeByName(rangeName);
+  const value = namedRange ? namedRange.getValue() : null;
+  console.log(`📡 Диапазон [${rangeName}]: ${namedRange ? '✅ Найдено' : '❌ НЕ НАЙДЕНО'}. Значение: ${value}`);
+  return value;
 }
 
+/**
+ * Возвращает корректную дату из именованного диапазона или null.
+ *
+ * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} ss
+ * @param {string} rangeName
+ * @returns {Date|null}
+ * @private
+ */
+function _getNamedRangeDateValue(ss, rangeName) {
+  const value = _getNamedRangeValue(ss, rangeName);
+  if (!value) return null;
+  const date = value instanceof Date ? value : new Date(value);
+  return isNaN(date.getTime()) ? null : date;
+}
 
+/**
+ * Положительное целое из одной ячейки (часы, размер окна выгрузки звонков и т.п.).
+ *
+ * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} ss
+ * @param {string} rangeName
+ * @returns {number|null}
+ * @private
+ */
+function _getNamedRangePositiveInteger_(ss, rangeName) {
+  const value = _getNamedRangeValue(ss, rangeName);
+  if (value === null || value === undefined || value === "") return null;
+  const n = typeof value === "number" ? Math.floor(value) : parseInt(String(value).trim(), 10);
+  if (isNaN(n) || n <= 0) return null;
+  return n;
+}
+
+/**
+ * Возвращает уникальный список непустых значений из именованного диапазона.
+ *
+ * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} ss
+ * @param {string} rangeName
+ * @returns {string[]}
+ * @private
+ */
+function _getNamedRangeUniqueList(ss, rangeName) {
+  const namedRange = ss.getRangeByName(rangeName);
+  if (!namedRange) return [];
+  const values = namedRange.getValues().flat().filter(String);
+  return [...new Set(values)];
+}
 
 /**
  * Сборка объекта конфигурации из именованных диапазонов таблицы.
@@ -210,65 +261,48 @@ function getLibraryStatus() {
  *   baseHeaders: string[],
  *   filterableHeaders: string[],
  *   requiredHeaders: string[],
+ *   callsBatchWindowHours: number|null,
  *   sourcesRange: GoogleAppsScript.Spreadsheet.Range|null
  * }|null} Объект конфигурации или null при критической ошибке.
  */
 function _initializeConfig(ss) {
   try {
-    const getVal = (name) => {
-      const r = ss.getRangeByName(name);
-      const val = r ? r.getValue() : null;
-      console.log(`📡 Диапазон [${name}]: ${r ? '✅ Найдено' : '❌ НЕ НАЙДЕНО'}. Значение: ${val}`);
-      return val;
-    };
-
-    const getDateVal = (name) => {
-      const val = getVal(name);
-      if (!val) return null;
-      const date = val instanceof Date ? val : new Date(val);
-      return isNaN(date.getTime()) ? null : date;
-    };
-
-    const getUniqueList = (name) => {
-      const r = ss.getRangeByName(name);
-      if (!r) return [];
-      const values = r.getValues().flat().filter(String);
-      return [...new Set(values)];
-    };
-
     // Присваиваем уточненные имена согласно сущностям
-    const leadFieldsSheet = getVal("ЛистПолейЛида"); 
-    const firstDay = getDateVal("ПервыйДень");
-    const lastDay = getDateVal("ПоследнийДень");
+    const leadFieldsSheet = _getNamedRangeValue(ss, "ЛистПолейЛида");
+    const firstDay = _getNamedRangeDateValue(ss, "ПервыйДень");
+    const lastDay = _getNamedRangeDateValue(ss, "ПоследнийДень");
 
     // Валидация: если заданы поля лида, нужны даты
     if (leadFieldsSheet && (!firstDay || !lastDay)) {
       throw new Error("Для работы с данными CRM необходимы корректные даты (ПервыйДень/ПоследнийДень).");
     }
 
-    const baseHeaders = getUniqueList("ПоляВывода");
-    const filterableHeaders = getUniqueList("ПоляДатФильтра");
+    const baseHeaders = _getNamedRangeUniqueList(ss, "ПоляВывода");
+    const filterableHeaders = _getNamedRangeUniqueList(ss, "ПоляДатФильтра");
 
     const config = {
       ss: ss,
-      leadsSheet:      getVal("ЛистВыгрузкиЛидов"), 
-      callsSheet:      getVal("ЛистВыгрузкиЗвонков"), 
-      sourcesSheet:    getVal("ЛистИсточников"),
-      officesSheet:    getVal("ЛистОфисов"),
+      leadsSheet:      _getNamedRangeValue(ss, "ЛистВыгрузкиЛидов"),
+      callsSheet:      _getNamedRangeValue(ss, "ЛистВыгрузкиЗвонков"),
+      sourcesSheet:    _getNamedRangeValue(ss, "ЛистИсточников"),
+      officesSheet:    _getNamedRangeValue(ss, "ЛистОфисов"),
       leadFieldsSheet: leadFieldsSheet,             
-      usersSheet:      getVal("ЛистСотрудников"),   
+      usersSheet:      _getNamedRangeValue(ss, "ЛистСотрудников"),
       firstDay:        firstDay,
       lastDay:         lastDay,
       baseHeaders:     baseHeaders,
       filterableHeaders:   filterableHeaders,
-      requiredHeaders: [...new Set(['ID', 'Название лида', ...baseHeaders, ...filterableHeaders])],
+      requiredHeaders: [...new Set(['ID', 'Название лида', 'Стадия', ...baseHeaders, ...filterableHeaders])],
+      // Именованный диапазон «РазмерОкнаВыгрузкиЗвонков», часы (например 72). Пусто — fallback в BitrixService.
+      callsBatchWindowHours: _getNamedRangePositiveInteger_(ss, "РазмерОкнаВыгрузкиЗвонков"),
       sourcesRange: ss.getRangeByName("ИсточникиПоГруппам")
     };
 
     console.log("🛠 CONFIG CHECK:", {
         leads: config.leadsSheet,
         calls: config.callsSheet,
-        dates: !!config.firstDay
+        dates: !!config.firstDay,
+        callsWindowHours: config.callsBatchWindowHours
       });
 
     return config;
@@ -404,7 +438,7 @@ function _processCalls(config, period, updateStatus) {
   
   try {
     updateStatus("📞 Загрузка статистики звонков...");
-    const callsData = ExportCallsToSheet(config, period); 
+    const callsData = ExportCallsToSheet(config, period, updateStatus); 
     
     if (callsData && callsData.length > 0) {
       updateStatus(`✍️ Запись ${callsData.length} звонков...`);
@@ -478,6 +512,7 @@ function _processLeads(config, period, allLeads, callsData, liveMap, updateStatu
   const maps = {
     "ASSIGNED_BY_ID": GetUsersMap(allLeads.map(l => l.ASSIGNED_BY_ID)),
     "SOURCE_ID": GetSourcesMap(allLeads.map(l => l.SOURCE_ID)),
+    "STATUS_ID": GetLeadStagesMap(allLeads.map(l => l.STATUS_ID)),
     "UF_CRM_1675850186": GetOfficesMap(allLeads.map(l => l.UF_CRM_1675850186)),
     "FIRST_CALL_DATE": firstCallsMap
   };
@@ -495,7 +530,7 @@ function _processLeads(config, period, allLeads, callsData, liveMap, updateStatu
   updateStatus(`🔍 Связей Лид-Звонок в памяти: ${connectionsFound}`);
 
   PrepareLeadsSheet(targetSheet, finalHeaders);
-  BtxWriteDataToSheet(targetSheet, allLeads, finalHeaders, liveMap, maps, dateCols, 'lead');
+  BtxWriteDataToSheet(targetSheet, allLeads, finalHeaders, liveMap, maps, dateCols, 'lead', updateStatus);
   
   return maps; 
 }
@@ -563,47 +598,41 @@ function _buildLeadFirstCallsMap(callsData, contactToLeadsMap) {
   };
 
   callsData.forEach(call => {
-    if (!call.CRM || !call.DATE) return;
+    if (!call.DATE) return;
+
+    const entityType = call.CRM_ENTITY_TYPE ? String(call.CRM_ENTITY_TYPE).toUpperCase() : "";
+    const entityIdRaw = call.CRM_ENTITY_ID;
+    const entityId = entityIdRaw != null && entityIdRaw !== "" ? String(entityIdRaw).trim() : "";
+    if (!entityId || entityId === "0") return;
 
     const statusCode = String(call.RAW_STATUS);
 
-    // --- 1. СИТО В САМОМ ВЕРХУ (ОБЩЕЕ ДЛЯ ВСЕХ) ---
-    // Если звонок плохой, мы ВООБЩЕ не смотрим, Лид это или Контакт.
-    if (["304", "603", "603-S"].includes(statusCode)) {
-      skippedCount++;
-      return;
-    }
-    
-    // Фильтр системных роботов
-    if (call.USER.indexOf('Система') !== -1 || call.TYPE === "информационный") {
+    // --- 1. Общий мусор (роботы, инфозвонки) ---
+    const userLabel = call.USER != null ? String(call.USER) : "";
+    if (userLabel.indexOf("Система") !== -1 || call.TYPE === "информационный") {
       skippedCount++;
       return;
     }
 
-    // Входящие: только успех
+    // Входящие: в зачёт первого звонка только успешные (200). Исходящие / обратные — любые коды.
     if (call.TYPE === "входящий" && statusCode !== "200") {
       skippedCount++;
       return;
     }
 
-    // --- 2. РАСПРЕДЕЛЕНИЕ (КОГДА ОЧИСТКА ПРОЙДЕНА) ---
-    const parts = call.CRM.split(': ');
-    const type = parts[0];
-    const id = parts[1];
-
-    if (type === 'LEAD') {
-      updateIndex(id, call.DATE);
-    } 
-    else if (type === 'CONTACT') {
-      const relatedLeads = contactToLeadsMap[id];
+    // --- 2. РАСПРЕДЕЛЕНИЕ — поля как в ответе voximplant (CRM_ENTITY_TYPE / CRM_ENTITY_ID), не строка CRM с листа
+    if (entityType === "LEAD") {
+      updateLead(entityId, call.DATE);
+    } else if (entityType === "CONTACT") {
+      const relatedLeads = contactToLeadsMap[entityId];
       if (relatedLeads) {
-        relatedLeads.forEach(lId => updateIndex(lId, call.DATE));
+        relatedLeads.forEach(lId => updateLead(lId, call.DATE));
       }
     }
   });
 
 
-  updateStatus(`🧹 Очистка: Пропущено ${skippedCount} технических/неуспешных звонков.`);
+  updateStatus(`🧹 Очистка: Пропущено ${skippedCount} звонков (робот/инфо или неуспешный входящий).`);
   return leadCallsIndex;
 }
 

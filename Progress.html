@@ -11,6 +11,16 @@
         border: 3px solid #f3f3f3; border-top: 3px solid #4285f4; 
         border-radius: 50%; width: 30px; height: 30px; 
         animation: spin 1s linear infinite; flex-shrink: 0;
+        transition: width .25s ease, height .25s ease, opacity .25s ease, margin .25s ease, border-width .25s ease;
+      }
+      .container.done { gap: 0; }
+      .container.done .loader {
+        width: 0;
+        height: 0;
+        opacity: 0;
+        margin: 0;
+        border-width: 0;
+        animation: none;
       }
       
       /* Лог справа - ОБНОВЛЕННЫЙ */
@@ -54,19 +64,31 @@
         logContainer.scrollTop = logContainer.scrollHeight;
       }
 
-      // 3. ПРОВЕРКА ЗАВЕРШЕНИЯ (🏆 - успех, ❌ - ошибка, ⚠️ - предупреждение)
-      if (/[🏆❌⚠️]/.test(statusText)) {
+      // 3. Завершаем только по финальным статусам.
+      // ⚠️ может быть промежуточным (например, "Найдено новых источников..."), поэтому не стопаемся на нем.
+      const isDone = statusText.indexOf("🏆 Готово!") !== -1 || statusText.indexOf("❌ Ошибка") !== -1;
+      if (isDone) {
         // Останавливаем опрос сервера (квоты Google не бесконечны)
         clearInterval(poll);
         
-        // Скрываем синий лоадер (спиннер)
-        var spinner = document.getElementById('spinner');
-        if (spinner) {
-          spinner.style.display = 'none'; 
+        // Схлопываем лоадер после завершения
+        var wrapper = document.querySelector('.container');
+        if (wrapper) {
+          wrapper.classList.add('done');
         }
       }
+    }).withFailureHandler(function(err) {
+      clearInterval(poll);
+      var logContainer = document.getElementById('log-container');
+      if (logContainer) {
+        logContainer.innerText = "❌ Ошибка получения статуса: " + (err && err.message ? err.message : err);
+      }
+      var wrapper = document.querySelector('.container');
+      if (wrapper) {
+        wrapper.classList.add('done');
+      }
     }).getProcessingStatus(); 
-  }, 500); // Опрос раз в 1.5 секунды
+  }, 500); // Опрос каждые 500 мс (функция getProcessingStatus — в скрипте таблицы, мост к библиотеке)
 </script>
 
 

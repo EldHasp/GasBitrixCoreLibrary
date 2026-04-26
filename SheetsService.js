@@ -13,8 +13,9 @@
 /**
  * УНИВЕРСАЛЬНЫЙ МЕТОД ЗАПИСИ ДАННЫХ (Рефакторинг)
  */
-function BtxWriteDataToSheet(sheet, dataItems, headers, liveMap, maps, dateCols, entityType = 'lead') {
+function BtxWriteDataToSheet(sheet, dataItems, headers, liveMap, maps, dateCols, entityType = 'lead', statusCb) {
   if (!dataItems || !dataItems.length) return;
+  const emit = typeof statusCb === 'function' ? statusCb : null;
   const startTime = new Date();
 
   // 1. Определяем базовые параметры
@@ -23,16 +24,26 @@ function BtxWriteDataToSheet(sheet, dataItems, headers, liveMap, maps, dateCols,
 
   // 2. Трансформация данных (через _transformItemToRow)
   console.time("⏱ Трансформация");
-  const rows = dataItems.map(item => _transformItemToRow(item, headers, liveMap, maps, dateCols));
+  const rows = [];
+  const transformChunk = 500;
+  for (let i = 0; i < dataItems.length; i += transformChunk) {
+    const chunk = dataItems.slice(i, i + transformChunk);
+    chunk.forEach(item => rows.push(_transformItemToRow(item, headers, liveMap, maps, dateCols)));
+    if (emit && (i + transformChunk >= dataItems.length || (i / transformChunk + 1) % 2 === 0)) {
+      emit(`🧱 Лиды: подготовка строк ${Math.min(i + transformChunk, dataItems.length)}/${dataItems.length}`);
+    }
+  }
   console.timeEnd("⏱ Трансформация");
 
   // 3. Запись значений
   const startRow = sheet.getLastRow() + 1;
+  if (emit) emit("💾 Лиды: запись значений в лист...");
   sheet.getRange(startRow, 1, rows.length, headers.length).setValues(rows);
 
   // 4. Наложение RichText ссылок
   if (titleIdx !== -1 && baseUrl) {
     console.time("⏱ Наложение ссылок");
+    if (emit) emit("🔗 Лиды: проставляю ссылки в названии...");
     const richTextRows = _prepareRichTextLinks(dataItems, baseUrl);
     sheet.getRange(startRow, titleIdx + 1, richTextRows.length, 1).setRichTextValues(richTextRows);
     console.timeEnd("⏱ Наложение ссылок");
@@ -40,6 +51,7 @@ function BtxWriteDataToSheet(sheet, dataItems, headers, liveMap, maps, dateCols,
 
   // 5. Финальное форматирование
   console.time("⏱ Форматирование");
+  if (emit) emit("🎨 Лиды: финальное форматирование листа...");
   _applyTableFormatting(sheet, startRow, rows.length, headers, dateCols);
   console.timeEnd("⏱ Форматирование");
 
@@ -135,7 +147,9 @@ function SyncSourcesReference(sourcesRange, currentSources) {
  * @property {string} DURATION - Длительность в формате ММ:СС.
  * @property {string} LINE - Название линии (например, verba-ats).
  * @property {number} COST - Стоимость звонка.
- * @property {string} CRM - Ссылка или ID сущности CRM.
+ * @property {string} [CRM_ENTITY_TYPE] - LEAD / CONTACT (как в API, для логики вне листа).
+ * @property {string} [CRM_ENTITY_ID] - ID сущности (как в API).
+ * @property {string} CRM - Подпись для колонки на листе.
  */
 
 /**

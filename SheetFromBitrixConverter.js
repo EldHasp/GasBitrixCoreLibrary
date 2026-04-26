@@ -30,18 +30,23 @@ function _transformItemToRow(item, headers, liveMap, maps, dateCols) {
     let value = item[techId];
     if (value === null || value === undefined || value === "") return "";
 
-    // 3. Маппинг справочников (Сотрудники, Источники)
+    // 3. Явный маппинг заранее подготовленных справочников
     if (maps[techId]) {
       if (Array.isArray(value)) {
         value = value.map(id => maps[techId][id.toString()] || id).join("; ");
       } else {
         value = maps[techId][value.toString()] || value;
       }
+    } else {
+      // 4. Fallback: универсальный авто-маппинг по типу поля (enumeration/crm_status/iblock_element и т.д.)
+      // Lazy loading словарей реализован в Helpers.js -> GetReadableValue.
+      value = GetReadableValue(techId, fieldData.type, value, maps);
     }
 
-    // 4. Типизация (Даты, Деньги, Мультиполя)
+    // 5. Типизация (Даты, Деньги, Мультиполя)
     const currentVisualIndex = colIdx + 1;
     if (dateCols.includes(currentVisualIndex)) {
+      if (value instanceof Date) return value;
       const d = new Date(value);
       return isNaN(d.getTime()) ? value : d;
     }
@@ -54,7 +59,7 @@ function _transformItemToRow(item, headers, liveMap, maps, dateCols) {
       return parseFloat(value.split('|')[0]);
     }
 
-    // 5. Защита от формул
+    // 6. Защита от формул
     if (typeof value === 'string' && ['=', '+', '-', '@'].includes(value[0])) {
       return " " + value;
     }

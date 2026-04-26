@@ -1,84 +1,10 @@
-
 /** Вспомогательный метод для единообразного форматирования имени */
 function FormatUserName(u) {
     let name = `${u.NAME || ""} ${u.LAST_NAME || ""}`.trim();
     return name || u.EMAIL || u.LOGIN || `ID ${u.ID}`;
 }
 
-/**
- * УНИВЕРСАЛЬНЫЙ СБОРЩИК СТРОКИ КОМАНДЫ ДЛЯ BATCH
- * Реализует правильное кодирование операторов и вложенных массивов (Triple Encoding).
- *
- * @param {string} method - Метод API (например, 'crm.lead.list')
- * @param {Object} params - Объект с параметрами (filter, select, order и т.д.)
- * @return {string} - Полностью закодированная строка для поля cmd
- */
-function BuildBatchCmd(method, params = {}) {
-    const parts = [];
-
-    /**
-     * Рекурсивная функция для превращения объекта в Query String формата Bitrix
-     */
-    function buildString(obj, prefix) {
-        for (const key in obj) {
-            if (obj.hasOwnProperty(key)) {
-                const k = prefix ? `${prefix}[${key}]` : key;
-                const v = obj[key];
-
-                if (v !== null && typeof v === 'object') {
-                    buildString(v, k);
-                } else {
-                    // Критически важное кодирование: encodeURIComponent делает ту самую
-                    // работу, чтобы [ ] > < = дошли до ядра Bitrix в целости.
-                    parts.push(`${encodeURIComponent(k)}=${encodeURIComponent(v)}`);
-                }
-            }
-        }
-    }
-
-    buildString(params);
-    return `${method}?${parts.join('&')}`;
-}
-
-
-/**
- * 1. УНИВЕРСАЛЬНЫЙ ВЫЗОВ (REST 2.0)
- * Самый стабильный метод для Лидов, Сделок и Batch-запросов.
- */
-function CallBitrix(method, params = {}) {
-    const url = BITRIX_URL + method;
-    return SendRequest(url, params);
-}
-
-/**
- * 2. ВЫЗОВ REST 3.0 (Для Задач и будущего)
- * Используется, когда нужно работать через эндпоинт /api/
- */
-function CallBitrix3(method, params = {}) {
-    const url = BITRIX_URL_REST_3_0 + method;
-    return SendRequest(url, params);
-}
-
-/**
- * 3. ВНУТРЕННЯЯ СИСТЕМНАЯ ФУНКЦИЯ
- * Чтобы не дублировать настройки UrlFetchApp
- */
-function SendRequest(url, params) {
-    const options = {
-        method: 'post',
-        contentType: 'application/json',
-        payload: JSON.stringify(params),
-        muteHttpExceptions: true
-    };
-
-    try {
-        const response = UrlFetchApp.fetch(url, options);
-        return JSON.parse(response.getContentText());
-    } catch (e) {
-        Logger.log(`⚠ Ошибка запроса к ${url}: ${e.message}`);
-        return { error: 'FETCH_ERROR', error_description: e.message };
-    }
-}
+// CallBitrix, CallBitrix3, SendRequest, BuildBatchCmd — см. BitrixCommandsService.js
 
 /**
  * УНИВЕРСАЛЬНЫЙ ПАРСЕР ДАТЫ (Улучшенная версия)
@@ -174,7 +100,9 @@ function _getCallTypeText(type) {
  * @property {string} DURATION - Длительность в формате ММ:СС.
  * @property {string} LINE - Название линии или номер портала (например, verba-ats).
  * @property {number} COST - Стоимость звонка (если передана Битриксом).
- * @property {string} CRM - Ссылка на сущность CRM (Лид: 123, Контакт: 456).
+ * @property {string} [CRM_ENTITY_TYPE] - Как в API: "LEAD" | "CONTACT" | "".
+ * @property {string} [CRM_ENTITY_ID] - ID сущности в CRM (строка), как в API.
+ * @property {string} CRM - Только для листа: человекочитаемая строка «LEAD: …» / «CONTACT: …».
  */
 
 /**
@@ -184,22 +112,30 @@ function _getCallTypeText(type) {
  * @param {Object} period - Объект {start, end} в формате ISO.
  * @returns {PreparedCall[]} Массив подготовленных объектов звонков для записи.
  */
-function ExportCallsToSheet(config, period) {
-  updateStatus("📞 Телефония: Начинаем сбор данных...");
+function ExportCallsToSheet(config, period, statusCb) {
+  const emit = typeof statusCb === 'function' ? statusCb : updateStatus;
+  emit("📞 Телефония: Начинаем сбор данных...");
   
   // 1. Сбор сырых данных
-  const rawCalls = GetCallsData(period);
-  updateStatus(`📞 Телефония: Получено ${rawCalls.length} записей из API`);
+  const callOpts = {};
+  if (config && config.callsBatchWindowHours != null) {
+    const co = typeof config.callsBatchWindowHours === "number" && isFinite(config.callsBatchWindowHours)
+      ? config.callsBatchWindowHours
+      : _parseCallsBatchWindowHoursString_(String(config.callsBatchWindowHours));
+    if (co != null) callOpts.windowHours = co;
+  }
+  const rawCalls = GetCallsData(period, emit, callOpts);
+  emit(`📞 Телефония: Получено ${rawCalls.length} записей из API`);
 
   if (rawCalls.length === 0) return [];
 
   // 2. Подготовка сотрудников
-  updateStatus("📞 Телефония: Маппинг менеджеров...");
+  emit("📞 Телефония: Маппинг менеджеров...");
   const userIds = rawCalls.map(c => c.PORTAL_USER_ID).filter(id => id);
   const usersMap = GetUsersMap(userIds);
 
   // 3. Формирование объектов
-  updateStatus("📞 Телефония: Формирование отчета...");
+  emit("📞 Телефония: Формирование отчета...");
   return rawCalls.map(c => {
     const durationSec = parseInt(c.CALL_DURATION) || 0;
     return {
@@ -213,6 +149,8 @@ function ExportCallsToSheet(config, period) {
       DURATION: Math.floor(durationSec / 60) + ":" + ("0" + (durationSec % 60)).slice(-2),
       LINE: c.PORTAL_NUMBER || "Внешняя линия",
       COST: parseFloat(c.COST) || 0,
+      CRM_ENTITY_TYPE: c.CRM_ENTITY_TYPE ? String(c.CRM_ENTITY_TYPE).toUpperCase() : "",
+      CRM_ENTITY_ID: c.CRM_ENTITY_ID != null && c.CRM_ENTITY_ID !== "" ? String(c.CRM_ENTITY_ID) : "",
       CRM: c.CRM_ENTITY_TYPE ? `${c.CRM_ENTITY_TYPE}: ${c.CRM_ENTITY_ID}` : ""
     };
   });
@@ -222,9 +160,160 @@ function ExportCallsToSheet(config, period) {
 
 
 /**
- * Потоковое получение статистики звонков из Bitrix24 (метод voximplant.statistic.get).
- * Использует фильтрацию по времени начала звонка для обхода ограничений пагинации.
- * Реализована защита от пропуска данных при наличии нескольких звонков в одну секунду.
+ * Форматирует дату в ISO с фиксированным смещением +03:00 (МСК).
+ * Используется для стабильного оконного сбора статистики звонков.
+ *
+ * @param {Date} dateObj
+ * @returns {string}
+ * @private
+ */
+function _formatIsoMsk(dateObj) {
+  const shifted = new Date(dateObj.getTime() + 3 * 60 * 60 * 1000);
+  const year = shifted.getUTCFullYear();
+  const month = ("0" + (shifted.getUTCMonth() + 1)).slice(-2);
+  const day = ("0" + shifted.getUTCDate()).slice(-2);
+  const hours = ("0" + shifted.getUTCHours()).slice(-2);
+  const minutes = ("0" + shifted.getUTCMinutes()).slice(-2);
+  const seconds = ("0" + shifted.getUTCSeconds()).slice(-2);
+  return `${year}-${month}-${day}T${hours}:${minutes}:${seconds}+03:00`;
+}
+
+/**
+ * @param {string|number} raw
+ * @returns {number|null} положительное целое или null
+ * @private
+ */
+function _parseCallsBatchWindowHoursString_(raw) {
+  if (raw === null || raw === undefined) return null;
+  const s = String(raw).trim();
+  if (s === "") return null;
+  const n = parseInt(s, 10);
+  if (isNaN(n) || n <= 0) return null;
+  return n;
+}
+
+/**
+ * Размер временного окна для batch-загрузки звонков.
+ *
+ * Приоритет: `optionalOverride` (из `config.callsBatchWindowHours` — обычно ячейка
+ * `РазмерОкнаВыгрузкиЗвонков` в «Справочнике») → **Свойства скрипта** GAS (редко) →
+ * **Свойства документа** таблицы → 24. Основной путь: именованный диапазон в таблице.
+ *
+ * @param {string|number|undefined|null} [optionalOverride]
+ * @returns {{hours: number, ms: number}}
+ * @private
+ */
+function _resolveCallsWindowSize(optionalOverride) {
+  const o = (typeof optionalOverride === "number" && optionalOverride > 0 && isFinite(optionalOverride))
+    ? Math.floor(optionalOverride)
+    : (optionalOverride != null && optionalOverride !== ""
+      ? _parseCallsBatchWindowHoursString_(String(optionalOverride))
+      : null);
+  if (o != null) {
+    return { hours: o, ms: o * 60 * 60 * 1000 };
+  }
+
+  let fromScript = null;
+  try {
+    fromScript = _parseCallsBatchWindowHoursString_(
+      PropertiesService.getScriptProperties().getProperty("CALLS_BATCH_WINDOW_HOURS")
+    );
+  } catch (e) {
+    console.warn(`⚠ Скрипт: CALLS_BATCH_WINDOW_HOURS: ${e.message}`);
+  }
+  if (fromScript != null) {
+    return { hours: fromScript, ms: fromScript * 60 * 60 * 1000 };
+  }
+
+  let fromDocument = null;
+  try {
+    fromDocument = _parseCallsBatchWindowHoursString_(
+      PropertiesService.getDocumentProperties().getProperty("CALLS_BATCH_WINDOW_HOURS")
+    );
+  } catch (e) {
+    // Нет привязанного документа (редко при вызове не из таблицы)
+  }
+  if (fromDocument != null) {
+    return { hours: fromDocument, ms: fromDocument * 60 * 60 * 1000 };
+  }
+
+  return { hours: 24, ms: 24 * 60 * 60 * 1000 };
+}
+
+/**
+ * Загружает звонки для одного временного окна через batch:
+ * 50 команд × 50 записей = до 2500 звонков за один batch-вызов.
+ *
+ * @param {string} windowStartIso
+ * @param {string} windowEndIso
+ * @param {Function|null} emit
+ * @param {number} windowNo
+ * @param {number} windowsTotal
+ * @returns {{rows: Object[], total: number, batches: number}}
+ * @private
+ */
+function _fetchCallsWindowBatch(windowStartIso, windowEndIso, emit, windowNo, windowsTotal) {
+  const collected = [];
+  let start = 0;
+  let total = 1;
+  let batchNo = 0;
+
+  while (start < total) {
+    const cmd = {};
+    for (let i = 0; i < 50; i++) {
+      const offset = start + i * 50;
+      if (total !== 1 && offset >= total) break;
+      cmd[`calls_${i}`] = BuildBatchCmd('voximplant.statistic.get', {
+        FILTER: {
+          ">=CALL_START_DATE": windowStartIso,
+          "<CALL_START_DATE": windowEndIso
+        },
+        SORT: "CALL_START_DATE",
+        ORDER: "ASC",
+        start: offset
+      });
+    }
+    const cmdCount = Object.keys(cmd).length;
+    if (cmdCount === 0) break;
+
+    const batchRes = CallBitrix('batch', { halt: 0, cmd: cmd });
+    const resultMap = (batchRes && batchRes.result && batchRes.result.result) ? batchRes.result.result : {};
+    const totalMap = (batchRes && batchRes.result && batchRes.result.result_total) ? batchRes.result.result_total : {};
+
+    Object.keys(resultMap).forEach(key => {
+      const rows = resultMap[key];
+      if (Array.isArray(rows) && rows.length > 0) collected.push(...rows);
+    });
+
+    const anyTotal = Object.values(totalMap)[0];
+    if (anyTotal !== undefined && anyTotal !== null && anyTotal !== "") {
+      const parsedTotal = Number(anyTotal);
+      if (!isNaN(parsedTotal) && parsedTotal >= 0) total = parsedTotal;
+    } else if (total === 1 && collected.length === 0) {
+      total = 0;
+    } else if (total === 1) {
+      total = start + cmdCount * 50 + 1;
+    }
+
+    start += cmdCount * 50;
+    batchNo++;
+
+    // Снижаем шум: показываем прогресс батчей только если в окне реально >1 batch.
+    if (emit && batchNo > 1) {
+      const processed = total > 0 ? Math.min(start, total) : collected.length;
+      emit(`📞 Телефония: окно ${windowNo}/${windowsTotal}, батч ${batchNo} (~${cmdCount * 50}) — ${processed}/${total > 0 ? total : collected.length}`);
+    }
+
+    if (cmdCount < 50 && Object.keys(resultMap).length < 50) break;
+  }
+
+  return { rows: collected, total: total, batches: batchNo };
+}
+
+/**
+ * Оконная загрузка статистики звонков из Bitrix24 (voximplant.statistic.get).
+ * Для скорости использует batch-пакеты до 2500 записей за итерацию,
+ * для устойчивости — дедупликацию по ID и сбор по непересекающимся временным окнам.
  * 
  * @param {Object} period - Объект с границами временного периода.
  * @param {string} period.start - Дата начала в формате ISO 8601 (например, "2024-01-01T00:00:00+03:00").
@@ -232,57 +321,75 @@ function ExportCallsToSheet(config, period) {
  * 
  * @returns {Object[]} Массив "сырых" объектов звонков из API Bitrix24.
  * 
+ * @param {{ windowHours?: number }|null} [options] — например, `{ windowHours: 72 }` из `config`.
  * @example
  * const period = { start: "2024-10-01T00:00:00+03:00", end: "2024-10-01T23:59:59+03:00" };
  * const calls = GetCallsData(period);
  */
-function GetCallsData(period) {
+function GetCallsData(period, statusCb, options) {
+  const emit = typeof statusCb === "function" ? statusCb : null;
   const allCalls = [];
-  const processedIds = new Set();
-  
-  // Используем чистый ISO формат из периода
-  let lastCallTime = period.start; 
-  let hasMore = true;
+  const seenCallIds = new Set();
+  const winArg =
+    options && (options.windowHours != null)
+      ? options.windowHours
+      : undefined;
+  const windowSize = _resolveCallsWindowSize(winArg);
+  const WINDOW_MS = windowSize.ms;
 
   console.log(`📞 СТАРТ СБОРА ЗВОНКОВ: с [${period.start}] по [${period.end}]`);
+  console.log(`📞 Размер окна batch: ${windowSize.hours} ч.`);
+  const startMs = new Date(period.start).getTime();
+  const endMs = new Date(period.end).getTime();
+  if (isNaN(startMs) || isNaN(endMs) || startMs >= endMs) {
+    console.warn("⚠ Некорректный период для звонков, возвращаю пустой массив.");
+    return [];
+  }
 
-  while (hasMore) {
-    const response = CallBitrix('voximplant.statistic.get', {
-      FILTER: {
-        ">=CALL_START_DATE": lastCallTime,
-        "<CALL_START_DATE": period.end
-      },
-      SORT: "CALL_START_DATE",
-      ORDER: "ASC"
+  const windowsTotal = Math.max(1, Math.ceil((endMs - startMs) / WINDOW_MS));
+  let cursor = startMs;
+  let windowNo = 0;
+
+  while (cursor < endMs) {
+    windowNo++;
+    const windowEnd = Math.min(cursor + WINDOW_MS, endMs);
+    const windowStartIso = _formatIsoMsk(new Date(cursor));
+    const windowEndIso = _formatIsoMsk(new Date(windowEnd));
+
+    // Старт окна: не печатать на каждом шаге (30 суток = 30 строк) — как у «окно завершено».
+    const shouldEmitWindowStart =
+      (windowNo === 1) || (windowNo === windowsTotal) || (windowNo % 5 === 0);
+    if (emit && shouldEmitWindowStart) {
+      emit(
+        `📞 Телефония: окно ${windowNo}/${windowsTotal} (${windowSize.hours}ч) ${windowStartIso} → ${windowEndIso}, пакет до 2500 записей`
+      );
+    }
+
+    const result = _fetchCallsWindowBatch(windowStartIso, windowEndIso, emit, windowNo, windowsTotal);
+    result.rows.forEach(call => {
+      const callId = call && call.ID != null ? String(call.ID) : "";
+      if (!callId) return;
+      if (!seenCallIds.has(callId)) {
+        seenCallIds.add(callId);
+        allCalls.push(call);
+      }
     });
 
-    const calls = response.result || [];
-
-    if (calls.length > 0) {
-      calls.forEach(call => {
-        // Дедупликация на случай нахлеста секунд
-        if (!processedIds.has(call.ID)) {
-          allCalls.push(call);
-          processedIds.add(call.ID);
-        }
-      });
-
-      // Обновляем отметку времени для следующей страницы
-      lastCallTime = calls[calls.length - 1].CALL_START_DATE;
-      
-      // Если пришло меньше 50 — мы дошли до конца TO_DATE
-      if (calls.length < 50) hasMore = false;
-      
-      // Очистка кэша ID (защита памяти)
-      if (processedIds.size > 500) {
-        const idsArray = Array.from(processedIds);
-        processedIds.clear();
-        idsArray.slice(-100).forEach(id => processedIds.add(id));
-      }
-    } else {
-      hasMore = false;
+    // Не спамим статусом по каждому окну: оставляем контрольные точки.
+    const shouldEmitWindowDone = (windowNo === 1) || (windowNo === windowsTotal) || (windowNo % 5 === 0) || (result.batches > 1);
+    if (emit && shouldEmitWindowDone) {
+      emit(`📞 Телефония: окно ${windowNo}/${windowsTotal} завершено, добавлено ${result.rows.length}, всего ${allCalls.length}`);
     }
+
+    cursor = windowEnd;
   }
+
+  allCalls.sort((a, b) => {
+    const ta = new Date(a.CALL_START_DATE).getTime();
+    const tb = new Date(b.CALL_START_DATE).getTime();
+    if (ta !== tb) return ta - tb;
+    return String(a.ID).localeCompare(String(b.ID), 'en', { numeric: true });
+  });
 
   console.log(`✅ Сбор завершен. Получено звонков: ${allCalls.length}`);
   return allCalls;

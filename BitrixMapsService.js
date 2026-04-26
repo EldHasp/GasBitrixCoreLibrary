@@ -213,117 +213,59 @@ function GetSourcesMap(sourceIds = []) {
     }, {});
 }
 
+/**
+ * ПОЛУЧЕНИЕ КОЛЛЕКЦИИ СТАДИЙ ЛИДА (STATUS)
+ * @param {string[]|number[]} [statusIds=[]]
+ * @returns {Object} - { "NEW": "Новый", "IN_PROCESS": "В работе", ... }
+ */
+function GetLeadStagesMap(statusIds = []) {
+    const response = CallBitrix('crm.status.list', {
+        filter: { "ENTITY_ID": "STATUS" }
+    });
+
+    const statuses = response.result || [];
+    const filterIds = (statusIds && statusIds.length > 0) ? statusIds.map(String) : null;
+
+    return statuses.reduce((map, st) => {
+        const key = st.STATUS_ID ? st.STATUS_ID.toString() : null;
+        if (!key) return map;
+        if (filterIds && !filterIds.includes(key)) return map;
+        map[key] = st.NAME || key;
+        return map;
+    }, {});
+}
 
 
 /**
- * КОМБИНИРОВАННЫЙ СБОР ЛИДОВ ПО НЕСКОЛЬКИМ ФИЛЬТРАМ (С ПОДДЕРЖКОЙ OR-ЛОГИКИ И BATCH)
+ * Виртуальное поле ALL_CONTACT_IDS: объединение CONTACT_ID и CONTACT_IDS без дублей.
+ * В REST из Битрикса приходит только CONTACT_ID / CONTACT_IDS; ALL_CONTACT_IDS в select не запрашивается.
+ * Заполняется один раз после сбора лидов — дальше связь со звонками читает только ALL_CONTACT_IDS.
  *
- * Метод реализует сбор уникальных лидов, попадающих под условия разных полей дат
- * (например, "Дата создания" ИЛИ "Дата квалификации"), исключая дублирование записей.
- *
- * 📔 ИСТОРИЯ РЕШЕНИЙ И ОПТИМИЗАЦИЙ:
- *
- * 1. Реализация логики "ИЛИ" (OR) в REST API:
- * - Проблема: Стандартный фильтр Битрикс24 работает по логике "И" (AND). Нельзя
- * одним запросом найти лиды, созданные ИЛИ квалифицированные в период.
- * - Решение: Последовательный перебор полей из FILTERABLE_HEADERS. Скрипт делает
- * отдельные проходы для каждого поля и объединяет результаты.
- *
- * 2. Использование структуры Set для дедупликации:
- * - Проблема: Метод [].includes() при проверке 17 000+ ID начинает существенно
- * замедлять выполнение (сложность O(n^2)).
- * - Решение: Использование объекта new Set(). Проверка наличия ID (метод .has)
- * выполняется за константное время O(1), что критично для больших выгрузок.
- *
- * 3. Агрегированное логирование:
- * - Решение: Внедрение компактного лога "Всего | Новых | Дублей". Это позволяет
- * визуально оценить пересечение выборок и эффективность каждого фильтра.
- *
- * 4. Инкапсуляция Batch-логики:
- * - Решение: Метод берет на себя всю работу с циклами while и пакетами по 50 команд,
- * возвращая в Main.gs уже "чистый" и расшифрованный массив объектов.
- *
- * @param {Object} period - Объект {start: "ISO", end: "ISO"}.
- * @param {string[]} headers - Массив уникальных заголовков таблицы.
- * @param {Object} liveMap - Живая карта полей из API.
- * @return {Object[]} Массив уникальных объектов лидов.
+ * @param {Object} lead — объект лида из crm.lead.list (мутируется).
  */
-function GetLeadsByFiltersMap(period, headers, liveMap, filterableHeaders) {
-  updateStatus(`Загрузка периода ${period}`);
-  const allLeads = [];
-  const collectedIds = new Set();
-  
-  // 1. ПРИНУДИТЕЛЬНО ДОБАВЛЯЕМ ТЕХНИЧЕСКИЕ ПОЛЯ В SELECT
-  // Нам нужны ID, CONTACT_ID, CONTACT_IDS и DATE_CREATE (для скорости реакции)
-  const essentialIds = ["ID", "CONTACT_ID", "CONTACT_IDS", "DATE_CREATE"];
-  const selectFields = headers.map(h => liveMap[h]?.id).filter(id => id);
-  
-  // Объединяем визуальные поля с техническими, убирая дубли
-  const finalSelect = [...new Set([...selectFields, ...essentialIds])];
+function fillVirtualAllContactIds(lead) {
+  const out = [];
+  const add = (v) => {
+    if (v === null || v === undefined || v === '' || v === '0') return;
+    const s = String(v).trim();
+    if (!s) return;
+    if (out.indexOf(s) === -1) out.push(s);
+  };
 
-  filterableHeaders.forEach(headerName => {
-    updateStatus(`Загрузка ${headerName}`);
-    const fieldInfo = liveMap[headerName];
-    if (!fieldInfo) return;
+  if (lead.CONTACT_ID != null && lead.CONTACT_ID !== '' && lead.CONTACT_ID !== '0') {
+    add(lead.CONTACT_ID);
+  }
 
-    const filterFieldId = fieldInfo.id;
-    const filter = {
-      [`>=${filterFieldId}`]: period.start,
-      [`<${filterFieldId}`]: period.end
-    };
-
-    let currentStart = 0;
-    const probe = CallBitrix('crm.lead.list', { filter: filter, select: ["ID"], limit: 1 });
-    const totalForFilter = probe.total || 0;
-
-    if (totalForFilter === 0) return;
-
-    while (currentStart < totalForFilter) {
-      const cmd = {};
-      let remaining = totalForFilter - currentStart;
-      let commandsCount = Math.min(50, Math.ceil(remaining / 50));
-
-      for (let i = 0; i < commandsCount; i++) {
-        cmd[`b_${i}`] = BuildBatchCmd('crm.lead.list', {
-          filter: filter,
-          order: { "ID": "ASC" },
-          start: currentStart + (i * 50),
-          select: finalSelect // ✅ Используем расширенный список полей
-        });
-      }
-
-      const response = CallBitrix('batch', { halt: 0, cmd: cmd });
-      const results = response.result.result;
-
-      for (let key in results) {
-        if (results[key]) {
-          const batchLeads = results[key];
-
-          batchLeads.forEach(lead => {
-            if (!collectedIds.has(lead.ID)) {
-              
-              // 2. ФОРМИРУЕМ ВИРТУАЛЬНОЕ ПОЛЕ ALL_CONTACT_IDS
-              const contactSet = new Set();
-              if (lead.CONTACT_ID && lead.CONTACT_ID !== "0") contactSet.add(String(lead.CONTACT_ID));
-              if (Array.isArray(lead.CONTACT_IDS)) {
-                lead.CONTACT_IDS.forEach(id => { if (id && id !== "0") contactSet.add(String(id)); });
-              }
-              
-              // Добавляем массив всех контактов прямо в объект лида
-              lead.ALL_CONTACT_IDS = Array.from(contactSet);
-
-              allLeads.push(lead);
-              collectedIds.add(lead.ID);
-            }
-          });
-        }
-      }
-      currentStart += (commandsCount * 50);
-      updateStatus(`Загружено лидов: ${currentStart.length}`);
+  const multi = lead.CONTACT_IDS;
+  if (multi != null) {
+    if (Array.isArray(multi)) {
+      multi.forEach(add);
+    } else if (typeof multi === 'string') {
+      multi.split(/[,\s;]+/).forEach(function (part) { add(part); });
     }
-  });
+  }
 
-  return allLeads;
+  lead.ALL_CONTACT_IDS = out;
 }
 
 /**
@@ -336,6 +278,9 @@ function GetContactToLeadsMap(allLeads) {
   let leadsWithContacts = 0;
 
   allLeads.forEach(lead => {
+    if (lead.ALL_CONTACT_IDS === undefined) {
+      fillVirtualAllContactIds(lead);
+    }
     const contactIds = lead.ALL_CONTACT_IDS;
     if (contactIds && contactIds.length > 0) {
       leadsWithContacts++;
@@ -426,88 +371,260 @@ function GetLeadFirstCallMap(rawCalls, contactToLeadsMap) {
  * - Решение: Метод берет на себя всю работу с циклами while и пакетами по 50 команд,
  * возвращая в Main.gs уже "чистый" и расшифрованный массив объектов.
  *
+ * 5. Вторичные поля дат (OR) без длинного !@ID:
+ * - Покрытие: (основное поле M в [start, end)) ∪ (S1 в периоде) ∪ … =
+ *   M ∪ (S1\\M) ∪ (S2\\M) … — снимаем пересечение с основной пачкой двумя фильтрами
+ *   (M<start, M>=end) вместо полного обхода «S в периоде».
+ *
  * @param {Object} period - Объект {start: "ISO", end: "ISO"}.
  * @param {string[]} headers - Массив уникальных заголовков таблицы.
  * @param {Object} liveMap - Живая карта полей из API.
  * @return {Object[]} Массив уникальных объектов лидов.
  */
-function GetLeadsByFiltersMap(period, headers, liveMap, filterableHeaders) {
-  const allLeads = [];
-  const collectedIds = new Set();
-  const selectFields = headers.map(h => liveMap[h]?.id).filter(id => id);
+function _collectLeadIdsByCursor(filter, progressCb, progressPrefix) {
+  const emit = typeof progressCb === 'function' ? progressCb : null;
+  const ids = [];
+  const seen = new Set();
+  const pagesPerBatch = 20; // 20 страниц * 50 = до 1000 ID за один batch-вызов
+  let lastId = 0;
+  let pageNo = 0;   // сквозной счетчик страниц
+  let batchNo = 0;
 
-  // 1. ПЕРВЫЙ ЭТАП: Забираем "Дата создания" (DATE_CREATE) как базу
-  // Предполагаем, что DATE_CREATE — это первый элемент или находим его
-  const mainHeader = filterableHeaders.find(h => liveMap[h].id === 'DATE_CREATE') || filterableHeaders[0];
-  const mainFieldId = liveMap[mainHeader].id;
-
-  console.log(`🚀 Начинаем сбор по основному полю: ${mainHeader}`);
-  
-  let start = 0;
-  let total = 1;
-  while (start < total) {
-    const res = CallBitrix('crm.lead.list', {
-      filter: { [`>=${mainFieldId}`]: period.start, [`<${mainFieldId}`]: period.end },
-      select: selectFields,
-      start: start
-    });
-    
-    if (res.result) {
-      res.result.forEach(lead => {
-        allLeads.push(lead);
-        collectedIds.add(lead.ID);
-      });
-    }
-    total = res.total || 0;
-    start += 50;
-  }
-  console.log(`✅ Основной сбор завершен: ${allLeads.length} лидов.`);
-
-  // 2. ВТОРОЙ ЭТАП: Проверяем остальные фильтры только на наличие НОВЫХ ID
-  const secondaryHeaders = filterableHeaders.filter(h => h !== mainHeader);
-  const idsToFetch = new Set();
-
-  secondaryHeaders.forEach(headerName => {
-    const fieldId = liveMap[headerName].id;
-    let sStart = 0;
-    let sTotal = 1;
-    
-    while (sStart < sTotal) {
-      const res = CallBitrix('crm.lead.list', {
-        filter: { [`>=${fieldId}`]: period.start, [`<${fieldId}`]: period.end },
-        select: ["ID"], // ТЯНЕМ ТОЛЬКО ID (это быстро!)
-        start: sStart
-      });
-      
-      if (res.result) {
-        res.result.forEach(l => {
-          if (!collectedIds.has(l.ID)) {
-            idsToFetch.add(l.ID); // Только те, кого еще нет в базе
-          }
+  while (true) {
+    const cmd = {};
+    for (let i = 0; i < pagesPerBatch; i++) {
+      const key = `p${i}`;
+      if (i === 0) {
+        const reqFilter = Object.assign({}, filter);
+        if (lastId > 0) reqFilter[">ID"] = lastId;
+        cmd[key] = BuildBatchCmd("crm.lead.list", {
+          filter: reqFilter,
+          order: { ID: "ASC" },
+          select: ["ID"],
+          start: 0
+        });
+      } else {
+        cmd[key] = BuildBatchCmd("crm.lead.list", {
+          filter: Object.assign({}, filter, { ">ID": `$result[p${i - 1}][49][ID]` }),
+          order: { ID: "ASC" },
+          select: ["ID"],
+          start: 0
         });
       }
-      sTotal = res.total || 0;
-      sStart += 50;
     }
-  });
 
-  // 3. ТРЕТИЙ ЭТАП: Дозагрузка недостающих данных (те самые 7%)
-  if (idsToFetch.size > 0) {
-    console.log(`📡 Догружаем уникальные лиды из других фильтров: ${idsToFetch.size} шт.`);
-    const extraIds = Array.from(idsToFetch);
-    
-    // Используем Batch по 50 ID, как обсуждали ранее
-    let i = 0;
-    while (i < extraIds.length) {
-      const chunk = extraIds.slice(i, i + 50);
-      const res = CallBitrix('crm.lead.list', {
+    batchNo++;
+    const batchRes = CallBitrix("batch", { halt: 1, cmd: cmd });
+    const result = batchRes && batchRes.result ? batchRes.result : {};
+    const resultMap = result.result || {};
+    const errors = result.result_error || {};
+
+    if (Object.keys(errors).length > 0) {
+      console.warn(`⚠️ Ошибки batch при сборе ID: ${JSON.stringify(errors)}`);
+      break;
+    }
+
+    let anyRows = false;
+    let shouldStop = false;
+    let lastTailIdInBatch = lastId;
+    let addedInBatch = 0;
+    let rowsInBatch = 0;
+    let pagesProcessedInBatch = 0;
+
+    for (let i = 0; i < pagesPerBatch; i++) {
+      const rows = Array.isArray(resultMap[`p${i}`]) ? resultMap[`p${i}`] : [];
+      if (rows.length > 0) anyRows = true;
+      pageNo++;
+      pagesProcessedInBatch++;
+      rowsInBatch += rows.length;
+
+      rows.forEach(row => {
+        const id = row && row.ID != null ? String(row.ID) : "";
+        if (!id || seen.has(id)) return;
+        seen.add(id);
+        ids.push(id);
+        addedInBatch++;
+      });
+
+      if (rows.length > 0) {
+        const tailRaw = rows[rows.length - 1] && rows[rows.length - 1].ID;
+        const tailId = Number(tailRaw);
+        if (isFinite(tailId) && tailId > lastTailIdInBatch) {
+          lastTailIdInBatch = tailId;
+        }
+      }
+
+      if (rows.length < 50) {
+        shouldStop = true;
+        break;
+      }
+    }
+
+    if (emit) {
+      emit(`${progressPrefix} — batch ${batchNo}: страниц ${pagesProcessedInBatch}, получено ${rowsInBatch}, новых ${addedInBatch}, всего ${ids.length}`);
+    }
+
+    if (!anyRows) break;
+    if (lastTailIdInBatch <= lastId) {
+      console.warn(`⚠️ Останов курсора: lastId=${lastId}, lastTailIdInBatch=${lastTailIdInBatch}`);
+      break;
+    }
+    lastId = lastTailIdInBatch;
+    if (shouldStop) break;
+  }
+
+  return { ids: ids, total: ids.length, pages: pageNo };
+}
+
+/**
+ * ID по полю secondField в [period.start, period.end), у которых mainField **вне** того же
+ * полуинтервала. Эквивалентно (S в периоде) \ (M в периоде) при OR-логике, если M — основной фильтр.
+ * Два компактных фильтра (M &lt; start / M &gt;= end) вместо полного обхода пересечения.
+ *
+ * @param {string} secondaryFieldId
+ * @param {string} mainFieldId
+ * @param {{start:string,end:string}} period
+ * @param {Function|null} progressCb
+ * @param {string} progressPrefix
+ * @returns {{ids: string[], total: number, pages: number, scanned: number}}
+ */
+function _collectLeadIdsSecondaryExcludingMainWindow(secondaryFieldId, mainFieldId, period, progressCb, progressPrefix) {
+  if (secondaryFieldId === mainFieldId) {
+    return _collectLeadIdsByCursor(
+      { [`>=${secondaryFieldId}`]: period.start, [`<${secondaryFieldId}`]: period.end },
+      progressCb,
+      progressPrefix
+    );
+  }
+  const fBase = {
+    [`>=${secondaryFieldId}`]: period.start,
+    [`<${secondaryFieldId}`]: period.end
+  };
+  const rBefore = _collectLeadIdsByCursor(
+    Object.assign({}, fBase, { [`<${mainFieldId}`]: period.start }),
+    progressCb,
+    progressPrefix
+  );
+  const rAfter = _collectLeadIdsByCursor(
+    Object.assign({}, fBase, { [`>=${mainFieldId}`]: period.end }),
+    null,
+    ""
+  );
+  const seen = new Set();
+  const out = [];
+  rBefore.ids.forEach(function (id) {
+    if (seen.has(id)) return;
+    seen.add(id);
+    out.push(id);
+  });
+  rAfter.ids.forEach(function (id) {
+    if (seen.has(id)) return;
+    seen.add(id);
+    out.push(id);
+  });
+  return {
+    ids: out,
+    total: out.length,
+    pages: (rBefore.pages || 0) + (rAfter.pages || 0),
+    scanned: rBefore.total + rAfter.total
+  };
+}
+
+function _fetchLeadsByIdsInBatch(leadIds, selectFields, progressCb, progressPrefix) {
+  const emit = typeof progressCb === 'function' ? progressCb : null;
+  const rowsOut = [];
+  const seen = new Set();
+  let i = 0;
+  let batchNo = 0;
+
+  while (i < leadIds.length) {
+    const cmd = {};
+    let cmdCount = 0;
+
+    while (cmdCount < 50 && i < leadIds.length) {
+      const chunk = leadIds.slice(i, i + 50);
+      cmd[`lead_by_id_${cmdCount}`] = BuildBatchCmd('crm.lead.list', {
         filter: { "@ID": chunk },
         select: selectFields
       });
-      if (res.result) allLeads.push(...res.result);
       i += 50;
+      cmdCount++;
+    }
+
+    batchNo++;
+    const batchRes = CallBitrix('batch', { halt: 0, cmd: cmd });
+    const resultMap = (batchRes && batchRes.result && batchRes.result.result) ? batchRes.result.result : {};
+
+    Object.keys(resultMap).forEach(key => {
+      const rows = resultMap[key];
+      if (!Array.isArray(rows) || rows.length === 0) return;
+      rows.forEach(lead => {
+        const leadId = lead && lead.ID != null ? String(lead.ID) : "";
+        if (!leadId || seen.has(leadId)) return;
+        seen.add(leadId);
+        rowsOut.push(lead);
+      });
+    });
+
+    if (emit) {
+      emit(`${progressPrefix} — батч ${batchNo} (~${cmdCount * 50}): ${Math.min(i, leadIds.length)}/${leadIds.length}`);
     }
   }
+
+  return rowsOut;
+}
+
+function GetLeadsByFiltersMap(period, headers, liveMap, filterableHeaders, progressCb) {
+  const emit = typeof progressCb === 'function' ? progressCb : null;
+  const collectedIds = new Set();
+
+  // Добавляем обязательные поля для аналитики
+  const essentialIds = ["ID", "CONTACT_ID", "CONTACT_IDS", "DATE_CREATE"];
+  const selectFields = [...new Set([...headers.map(h => liveMap[h]?.id).filter(id => id), ...essentialIds])];
+  if (!filterableHeaders || filterableHeaders.length === 0) return [];
+
+  // 1. ПЕРВЫЙ ЭТАП: собираем только ID через стабильный курсор >ID
+  const mainHeader = filterableHeaders.find(h => liveMap[h].id === 'DATE_CREATE') || filterableHeaders[0];
+  const mainFieldId = liveMap[mainHeader].id;
+
+  const mainResult = _collectLeadIdsByCursor(
+    { [`>=${mainFieldId}`]: period.start, [`<${mainFieldId}`]: period.end },
+    emit,
+    `🛰 Лиды: основной фильтр "${mainHeader}"`
+  );
+  mainResult.ids.forEach(id => collectedIds.add(id));
+  console.log(`✅ Основной сбор ID завершен: ${mainResult.total} уникальных ID.`);
+
+  // 2. ВТОРОЙ ЭТАП: остальные фильтры (OR) — только «новые» к основной выборке:
+  // вторичное поле в периоде, но основное (main) поле вне [start, end) — без длинного !@ID.
+  const secondaryHeaders = filterableHeaders.filter(h => h !== mainHeader);
+  secondaryHeaders.forEach(headerName => {
+    const fieldId = liveMap[headerName].id;
+    const before = collectedIds.size;
+    const secResult = _collectLeadIdsSecondaryExcludingMainWindow(
+      fieldId,
+      mainFieldId,
+      period,
+      null,
+      ""
+    );
+    secResult.ids.forEach(id => collectedIds.add(id));
+    const added = collectedIds.size - before;
+    if (emit) {
+      emit(
+        `🔎 Лиды: фильтр "${headerName}" (вне «${mainHeader}») — уник. ${secResult.total}, новых: ${added}, всего: ${collectedIds.size}`
+      );
+    }
+  });
+
+  // 3. ТРЕТИЙ ЭТАП: Дозагрузка полных данных только по собранным ID
+  const allIds = Array.from(collectedIds);
+  if (allIds.length === 0) return [];
+  if (emit) emit(`📡 Лиды: дозагрузка карточек по ID (${allIds.length})...`);
+  const allLeads = _fetchLeadsByIdsInBatch(allIds, selectFields, emit, `📡 Лиды: загрузка по @ID`);
+
+  allLeads.forEach(fillVirtualAllContactIds);
+  if (emit) emit(`✅ Лиды: собрано ${allLeads.length} уникальных записей.`);
 
   return allLeads;
 }
