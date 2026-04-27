@@ -35,10 +35,14 @@
  *    false — автоматический (триггер, тихий режим).
  */
 
+var _SYNC_STATE_VERBOSE_ = false;
+
 function ExportLeadsToSheet(ss, isManual = false) {
   const startTime = new Date();
 
   CacheService.getUserCache().remove('status');
+  CacheService.getUserCache().remove('status_summary');
+  CacheService.getUserCache().remove('status_done');
   SpreadsheetApp.flush();
   
   if (isManual) {
@@ -50,6 +54,8 @@ function ExportLeadsToSheet(ss, isManual = false) {
   try {
     const config = _initializeConfig(ss);
     if (!config) throw new Error("Не удалось загрузить конфигурацию.");
+    _SYNC_STATE_VERBOSE_ = !!config.verboseSyncLog;
+    syncDebugLogStart_(_SYNC_STATE_VERBOSE_);
 
     const period = _prepareExportPeriod(config);
     const liveMap = GetLiveFieldsMap();
@@ -88,6 +94,9 @@ function ExportLeadsToSheet(ss, isManual = false) {
   } catch (e) {
     updateStatus(`❌ Ошибка: ${e.message}`);
     console.error(e);
+  } finally {
+    syncDebugLogFinishRun_();
+    _SYNC_STATE_VERBOSE_ = false;
   }
 }
 
@@ -113,6 +122,8 @@ function ExportLeadsToSheet(ss, isManual = false) {
 function updateStatus(msg) {
   const cache = CacheService.getUserCache();
   const logKey = 'status'; 
+  const summaryKey = "status_summary";
+  const doneKey = "status_done";
   
   // 1. Формируем временную метку [14:30:05]
   const now = new Date();
@@ -138,9 +149,33 @@ function updateStatus(msg) {
   
   // 5. Записываем в кэш
   cache.put(logKey, currentLog, 120);
+  cache.put(summaryKey, newEntry, 120);
+  if (msg.indexOf("🏆 Готово!") !== -1 || msg.indexOf("❌ Ошибка") !== -1) {
+    cache.put(doneKey, "1", 120);
+  }
+  if (_SYNC_STATE_VERBOSE_) {
+    syncDebugLogAppend_(newEntry);
+  }
   
   // Дублируем в консоль для отладки
   console.log(`[ST] ${newEntry}`);
+}
+
+/**
+ * Обновляет только короткую строку прогресса (без добавления в подробный лог).
+ * Используется для «живых» частых апдейтов, чтобы не засорять окно.
+ *
+ * @param {string} msg
+ */
+function updateStatusSummary(msg) {
+  const cache = CacheService.getUserCache();
+  const now = new Date();
+  const timeStr = "[" + now.getHours().toString().padStart(2, "0") + ":" +
+                  now.getMinutes().toString().padStart(2, "0") + ":" +
+                  now.getSeconds().toString().padStart(2, "0") + "] ";
+  const entry = timeStr + msg;
+  cache.put("status_summary", entry, 120);
+  console.log(`[ST_SUMMARY] ${entry}`);
 }
 
 
@@ -160,6 +195,54 @@ function getLibraryStatus() {
     console.error("❌ Ошибка получения статуса из кэша: " + e.message);
     return "⚠️ Ошибка кэша";
   }
+}
+
+/**
+ * Расширенный статус для нового Progress.html:
+ * - summary: 1 строка (последнее сообщение)
+ * - log: хвост подробного лога для окна (ограничен)
+ * - done: завершена ли синхронизация
+ * - canSaveDebugLog: доступна ли кнопка «Сохранить лог»
+ *
+ * @returns {{summary: string, log: string, done: boolean, canSaveDebugLog: boolean}}
+ */
+function getLibraryStatusPayload() {
+  const cache = CacheService.getUserCache();
+  const log = cache.get("status") || "";
+  const summary = cache.get("status_summary") || "Подготовка...";
+  const done = cache.get("status_done") === "1";
+  return {
+    summary: summary,
+    log: log,
+    done: done,
+    canSaveDebugLog: done && syncDebugLogHasPendingSave_()
+  };
+}
+
+/**
+ * Совместимость с таблицей: мост для Progress.html.
+ * Если хост вызывает getProcessingStatusPayload(), можно сразу вернуть объект.
+ *
+ * @returns {{summary: string, log: string, done: boolean, canSaveDebugLog: boolean}}
+ */
+function getProcessingStatusPayload() {
+  return getLibraryStatusPayload();
+}
+
+/**
+ * Совместимость с таблицей: ручное сохранение отладочного лога.
+ * @returns {{ok: boolean, name?: string, url?: string, id?: string, message?: string}}
+ */
+function saveProcessingDebugLog() {
+  return syncDebugLogSavePermanently_();
+}
+
+/**
+ * Совместимость с таблицей: best-effort очистка temp-лога на закрытие окна.
+ * @returns {{ok: boolean}}
+ */
+function discardProcessingDebugLog() {
+  return syncDebugLogDiscardAfterClose_();
 }
 
 function initClient(ss) {
@@ -214,6 +297,23 @@ function _getNamedRangeDateValue(ss, rangeName) {
 }
 
 /**
+ * Булево значение из именованного диапазона (TRUE/1/да/yes/on).
+ *
+ * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} ss
+ * @param {string} rangeName
+ * @returns {boolean}
+ * @private
+ */
+function _getNamedRangeBoolean_(ss, rangeName) {
+  const value = _getNamedRangeValue(ss, rangeName);
+  if (value === null || value === undefined || value === "") return false;
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  const s = String(value).trim().toLowerCase();
+  return s === "true" || s === "1" || s === "yes" || s === "y" || s === "on" || s === "да";
+}
+
+/**
  * Положительное целое из одной ячейки (часы, размер окна выгрузки звонков и т.п.).
  *
  * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} ss
@@ -262,6 +362,7 @@ function _getNamedRangeUniqueList(ss, rangeName) {
  *   filterableHeaders: string[],
  *   requiredHeaders: string[],
  *   callsBatchWindowHours: number|null,
+ *   verboseSyncLog: boolean,
  *   sourcesRange: GoogleAppsScript.Spreadsheet.Range|null
  * }|null} Объект конфигурации или null при критической ошибке.
  */
@@ -295,6 +396,8 @@ function _initializeConfig(ss) {
       requiredHeaders: [...new Set(['ID', 'Название лида', 'Стадия', ...baseHeaders, ...filterableHeaders])],
       // Именованный диапазон «РазмерОкнаВыгрузкиЗвонков», часы (например 72). Пусто — fallback в BitrixService.
       callsBatchWindowHours: _getNamedRangePositiveInteger_(ss, "РазмерОкнаВыгрузкиЗвонков"),
+      // Именованный диапазон «ПодробныйЛогСинхронизации» (TRUE/1/да) — включает temp debug log + кнопку «Сохранить».
+      verboseSyncLog: _getNamedRangeBoolean_(ss, "ПодробныйЛогСинхронизации"),
       sourcesRange: ss.getRangeByName("ИсточникиПоГруппам")
     };
 
@@ -302,7 +405,8 @@ function _initializeConfig(ss) {
         leads: config.leadsSheet,
         calls: config.callsSheet,
         dates: !!config.firstDay,
-        callsWindowHours: config.callsBatchWindowHours
+        callsWindowHours: config.callsBatchWindowHours,
+        verboseSyncLog: config.verboseSyncLog
       });
 
     return config;
@@ -500,7 +604,7 @@ function _processLeads(config, period, allLeads, callsData, liveMap, updateStatu
   });
 
   // 4. Подготовка заголовков и маппингов
-  const finalHeaders = [...config.requiredHeaders, "Дата первого звонка", "Скорость реакции (сек)"];
+  const finalHeaders = [...config.requiredHeaders, "Дата первого звонка", "Скорость реакции (мин:сек)"];
   
   // ИСПРАВЛЕНО: Используем let, чтобы можно было создать лист, если его нет
   let targetSheet = config.ss.getSheetByName(config.leadsSheet);

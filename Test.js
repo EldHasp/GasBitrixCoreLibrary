@@ -635,3 +635,299 @@ function debugTestQualifiedExcludingCreationPeriod_April2026() {
     _resolveQualifiedUfForTest_()
   );
 }
+
+/**
+ * Возвращает total по окну максимально "дешево":
+ * - сначала пытается взять total из первого запроса (start=0),
+ * - если total в ответе отсутствует, досчитывает пагинацией по 50.
+ *
+ * @param {string} startIso
+ * @param {string} endIso
+ * @returns {number}
+ * @private
+ */
+function _debugCountCallsInWindow_(startIso, endIso) {
+  const baseParams = {
+    FILTER: {
+      ">=CALL_START_DATE": startIso,
+      "<CALL_START_DATE": endIso
+    },
+    SORT: "CALL_START_DATE",
+    ORDER: "ASC",
+    start: 0
+  };
+
+  const first = CallBitrix("voximplant.statistic.get", baseParams) || {};
+  const rows = Array.isArray(first.result) ? first.result : [];
+  const totalRaw = (first.total != null) ? first.total : first.result_total;
+  const totalNum = Number(totalRaw);
+  if (!isNaN(totalNum) && totalNum >= 0) {
+    return totalNum;
+  }
+
+  // fallback: считаем страницами по 50
+  let count = rows.length;
+  if (rows.length < 50) return count;
+
+  let start = 50;
+  while (true) {
+    const page = CallBitrix("voximplant.statistic.get", Object.assign({}, baseParams, { start: start })) || {};
+    const pRows = Array.isArray(page.result) ? page.result : [];
+    count += pRows.length;
+    if (pRows.length < 50) break;
+    start += 50;
+  }
+  return count;
+}
+
+/**
+ * Быстрый подсчёт количества звонков за период по окнам.
+ *
+ * @param {{start:string, end:string}} period
+ * @param {number} windowHours
+ * @returns {number}
+ * @private
+ */
+function _debugCountCallsByPeriodWindows_(period, windowHours) {
+  const startMs = new Date(period.start).getTime();
+  const endMs = new Date(period.end).getTime();
+  if (isNaN(startMs) || isNaN(endMs) || startMs >= endMs) return 0;
+
+  const stepMs = Math.max(1, parseInt(windowHours, 10) || 72) * 60 * 60 * 1000;
+  let cursor = startMs;
+  let total = 0;
+  let windowNo = 0;
+  const windowsTotal = Math.ceil((endMs - startMs) / stepMs);
+
+  while (cursor < endMs) {
+    windowNo++;
+    const wEnd = Math.min(cursor + stepMs, endMs);
+    const wStartIso = _formatIsoMsk(new Date(cursor));
+    const wEndIso = _formatIsoMsk(new Date(wEnd));
+    const c = _debugCountCallsInWindow_(wStartIso, wEndIso);
+    total += c;
+    if (windowNo === 1 || windowNo === windowsTotal || windowNo % 10 === 0) {
+      console.log(`COUNT window ${windowNo}/${windowsTotal}: +${c}, total=${total}`);
+    }
+    cursor = wEnd;
+  }
+
+  return total;
+}
+
+/**
+ * ТЕСТ: сравнить фактический count звонков и ID-оценку по годам 2023..2026.
+ * Пишет всё в Execution log.
+ *
+ * @param {number} [fromYear=2023]
+ * @param {number} [toYear=2026]
+ * @param {number} [windowHours=72]
+ */
+function debugCallsEstimateByYears(fromYear = 2023, toYear = 2026, windowHours = 72) {
+  const y1 = parseInt(fromYear, 10) || 2023;
+  const y2 = parseInt(toYear, 10) || 2026;
+  const startYear = Math.min(y1, y2);
+  const endYear = Math.max(y1, y2);
+
+  const now = new Date();
+  const nowMs = now.getTime();
+  const rows = [];
+
+  console.log(`🧪 Calls estimate test: years ${startYear}..${endYear}, windowHours=${windowHours}`);
+
+  for (let y = startYear; y <= endYear; y++) {
+    const periodStart = `${y}-01-01T00:00:00+03:00`;
+    const nextYearStartIso = `${y + 1}-01-01T00:00:00+03:00`;
+    const nextYearStartMs = new Date(nextYearStartIso).getTime();
+    const periodEnd = (nextYearStartMs > nowMs) ? _formatIsoMsk(now) : nextYearStartIso;
+
+    if (new Date(periodStart).getTime() >= new Date(periodEnd).getTime()) {
+      console.log(`- ${y}: период в будущем, пропуск`);
+      continue;
+    }
+
+    const period = { start: periodStart, end: periodEnd };
+    console.log(`\n📅 YEAR ${y}: ${period.start} -> ${period.end}`);
+
+    const estimate = _estimateCallsByIdRange_(period);
+    const estimated = estimate && estimate.estimated != null ? Number(estimate.estimated) : null;
+    const actual = _debugCountCallsByPeriodWindows_(period, windowHours);
+
+    const ratio = (estimated && estimated > 0) ? (actual / estimated) : null;
+    const diffAbs = (estimated != null) ? (actual - estimated) : null;
+    const diffPct = (estimated && estimated > 0) ? ((diffAbs / estimated) * 100) : null;
+
+    rows.push({
+      year: y,
+      actual: actual,
+      estimated: estimated,
+      ratio: ratio,
+      diffAbs: diffAbs,
+      diffPct: diffPct
+    });
+
+    console.log(
+      `YEAR ${y}: actual=${actual}, estimate=${estimated}, ratio=${ratio != null ? ratio.toFixed(4) : "n/a"}, diff=${diffAbs != null ? diffAbs : "n/a"} (${diffPct != null ? diffPct.toFixed(2) + "%" : "n/a"})`
+    );
+  }
+
+  if (rows.length === 0) {
+    console.log("Нет данных для отчёта.");
+    return;
+  }
+
+  const valid = rows.filter(r => r.ratio != null && isFinite(r.ratio));
+  const avgRatio = valid.length ? valid.reduce((s, r) => s + r.ratio, 0) / valid.length : null;
+  const medianRatio = valid.length
+    ? valid
+        .map(r => r.ratio)
+        .sort((a, b) => a - b)[Math.floor(valid.length / 2)]
+    : null;
+
+  console.log("\n=== SUMMARY ===");
+  rows.forEach(r => {
+    console.log(
+      `${r.year}: actual=${r.actual}, estimate=${r.estimated}, ratio=${r.ratio != null ? r.ratio.toFixed(4) : "n/a"}, diff=${r.diffAbs != null ? r.diffAbs : "n/a"} (${r.diffPct != null ? r.diffPct.toFixed(2) + "%" : "n/a"})`
+    );
+  });
+  console.log(`avg_ratio(actual/estimate)=${avgRatio != null ? avgRatio.toFixed(4) : "n/a"}`);
+  console.log(`median_ratio(actual/estimate)=${medianRatio != null ? medianRatio.toFixed(4) : "n/a"}`);
+  if (avgRatio != null) {
+    console.log(`recommended_coef_for_estimate ≈ ${avgRatio.toFixed(4)} (estimate * coef)`);
+  }
+}
+
+/**
+ * ТЕСТ ТОЧНОСТИ по "Дата создания":
+ * 1) База: ID только по основному фильтру DATE_CREATE в [start, end)
+ * 2) Финал: ID после полного OR-сбора
+ * 3) Подсчёт в финале тех, у кого DATE_CREATE реально в [start, end)
+ * 4) Подсчёт строк на листе выгрузки с DATE_CREATE в [start, end)
+ *
+ * Нужен для диагностики расхождения вида "в логе 843, на листе 850".
+ *
+ * @param {string|null} [periodStartIso=null] - Явное начало периода, иначе берётся из named ranges.
+ * @param {string|null} [periodEndIso=null] - Явный конец периода, иначе из named ranges.
+ * @returns {Object}
+ */
+function debugAuditDateCreatePrecision(periodStartIso = null, periodEndIso = null) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const config = _initializeConfig(ss);
+  if (!config) throw new Error("Не удалось инициализировать config.");
+
+  const period = (periodStartIso && periodEndIso)
+    ? { start: String(periodStartIso), end: String(periodEndIso) }
+    : _prepareExportPeriod(config);
+
+  const startMs = new Date(period.start).getTime();
+  const endMs = new Date(period.end).getTime();
+  if (!isFinite(startMs) || !isFinite(endMs) || startMs >= endMs) {
+    throw new Error(`Некорректный период: ${period.start} .. ${period.end}`);
+  }
+
+  const liveMap = GetLiveFieldsMap();
+  const mainFieldId = (liveMap["Дата создания"] && liveMap["Дата создания"].id) ? liveMap["Дата создания"].id : "DATE_CREATE";
+
+  console.log("🧪 debugAuditDateCreatePrecision");
+  console.log(`Период [start, end): ${period.start} .. ${period.end}`);
+  console.log(`Основное поле: ${mainFieldId}`);
+
+  // 1) Только основной фильтр
+  const baseRes = _collectLeadIdsByCursor(
+    { [`>=${mainFieldId}`]: period.start, [`<${mainFieldId}`]: period.end },
+    null,
+    ""
+  );
+  const baseSet = new Set(baseRes.ids.map(String));
+  console.log(`[BASE] IDs по DATE_CREATE в периоде: ${baseSet.size}`);
+
+  // 2) Полный OR-сбор (как в рабочей выгрузке)
+  const allLeads = GetLeadsByFiltersMap(period, config.requiredHeaders, liveMap, config.filterableHeaders, null);
+  const finalSet = new Set(allLeads.map(l => String(l.ID)));
+  console.log(`[FINAL] IDs после OR/дедуп: ${finalSet.size}`);
+
+  // 3) Из финала берём только тех, у кого DATE_CREATE в периоде
+  const finalInRange = [];
+  const finalOutRange = [];
+  allLeads.forEach(l => {
+    const d = l && l.DATE_CREATE ? new Date(l.DATE_CREATE).getTime() : NaN;
+    if (!isFinite(d)) return;
+    if (d >= startMs && d < endMs) finalInRange.push(String(l.ID));
+    else finalOutRange.push(String(l.ID));
+  });
+  const finalInRangeSet = new Set(finalInRange);
+  console.log(`[FINAL in range] IDs с DATE_CREATE в периоде: ${finalInRangeSet.size}`);
+  console.log(`[FINAL out range] IDs вне периода: ${finalOutRange.length}`);
+
+  // 4) Сравнение BASE vs FINAL(in range)
+  const onlyBase = [];
+  baseSet.forEach(id => { if (!finalInRangeSet.has(id)) onlyBase.push(id); });
+  const onlyFinalInRange = [];
+  finalInRangeSet.forEach(id => { if (!baseSet.has(id)) onlyFinalInRange.push(id); });
+
+  console.log(`Δ only BASE (есть в base, нет в finalInRange): ${onlyBase.length}`);
+  console.log(`Δ only FINAL(in range) (есть в finalInRange, нет в base): ${onlyFinalInRange.length}`);
+  if (onlyBase.length) {
+    console.log(`sample only BASE: ${onlyBase.slice(0, 20).join(", ")}`);
+  }
+  if (onlyFinalInRange.length) {
+    console.log(`sample only FINAL(in range): ${onlyFinalInRange.slice(0, 20).join(", ")}`);
+  }
+
+  // 5) Проверка строк на листе (что реально видит пользователь)
+  let sheetCountInRange = null;
+  if (config.leadsSheet) {
+    const sh = ss.getSheetByName(config.leadsSheet);
+    if (sh) {
+      const values = sh.getDataRange().getValues();
+      if (values.length > 1) {
+        const headers = values[0].map(h => String(h || "").trim());
+        const idIdx = headers.indexOf("ID");
+        const dcIdx = headers.indexOf("Дата создания");
+        if (idIdx !== -1 && dcIdx !== -1) {
+          let cnt = 0;
+          const idsInRangeOnSheet = [];
+          for (let r = 1; r < values.length; r++) {
+            const rawDate = values[r][dcIdx];
+            const ms = (rawDate instanceof Date) ? rawDate.getTime() : new Date(rawDate).getTime();
+            if (!isFinite(ms)) continue;
+            if (ms >= startMs && ms < endMs) {
+              cnt++;
+              idsInRangeOnSheet.push(String(values[r][idIdx] || "").trim());
+            }
+          }
+          sheetCountInRange = cnt;
+          const sheetSet = new Set(idsInRangeOnSheet.filter(Boolean));
+          console.log(`[SHEET] строк с "Дата создания" в периоде: ${sheetCountInRange}`);
+
+          const onlySheet = [];
+          sheetSet.forEach(id => { if (!finalInRangeSet.has(id)) onlySheet.push(id); });
+          const missingOnSheet = [];
+          finalInRangeSet.forEach(id => { if (!sheetSet.has(id)) missingOnSheet.push(id); });
+
+          console.log(`Δ sheet-only vs finalInRange: ${onlySheet.length}`);
+          console.log(`Δ missing on sheet vs finalInRange: ${missingOnSheet.length}`);
+          if (onlySheet.length) console.log(`sample sheet-only: ${onlySheet.slice(0, 20).join(", ")}`);
+          if (missingOnSheet.length) console.log(`sample missing-on-sheet: ${missingOnSheet.slice(0, 20).join(", ")}`);
+        } else {
+          console.log(`⚠ На листе "${config.leadsSheet}" не найдены колонки ID/Дата создания`);
+        }
+      }
+    }
+  }
+
+  const result = {
+    period: period,
+    baseCount: baseSet.size,
+    finalCount: finalSet.size,
+    finalInRangeCount: finalInRangeSet.size,
+    finalOutRangeCount: finalOutRange.length,
+    onlyBaseCount: onlyBase.length,
+    onlyFinalInRangeCount: onlyFinalInRange.length,
+    sheetInRangeCount: sheetCountInRange
+  };
+
+  console.log("=== RESULT ===");
+  console.log(JSON.stringify(result));
+  return result;
+}

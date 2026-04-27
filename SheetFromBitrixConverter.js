@@ -16,10 +16,12 @@ function _transformItemToRow(item, headers, liveMap, maps, dateCols) {
       return callDate ? new Date(callDate) : "";
     }
 
-    if (header === "Скорость реакции (сек)") {
+    if (header === "Скорость реакции (мин:сек)") {
       const callDate = maps.FIRST_CALL_DATE ? maps.FIRST_CALL_DATE[item.ID] : null;
       if (!callDate || !item.DATE_CREATE) return "";
-      return Math.round((new Date(callDate).getTime() - new Date(item.DATE_CREATE).getTime()) / 1000);
+      const seconds = Math.round((new Date(callDate).getTime() - new Date(item.DATE_CREATE).getTime()) / 1000);
+      // Для корректного отображения как [m] "мин" ss "сек" Google Sheets ожидает доли суток.
+      return seconds / 86400;
     }
 
     // 2. Стандартные поля
@@ -119,8 +121,8 @@ function _applyTableFormatting(sheet, startRow, numRows, headers, dateCols) {
   sheet.getRange(startRow, 1, numRows, 1).setNumberFormat("0");
 
   // 3. Форматирование "Скорости реакции" (если есть)
-  const speedIdx = headers.indexOf("Скорость реакции (сек)");
+  const speedIdx = headers.indexOf("Скорость реакции (мин:сек)");
   if (speedIdx !== -1) {
-    sheet.getRange(startRow, speedIdx + 1, numRows, 1).setNumberFormat("#,##0");
+    sheet.getRange(startRow, speedIdx + 1, numRows, 1).setNumberFormat('[m] "мин" ss "сек"');
   }
 }

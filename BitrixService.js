@@ -124,6 +124,13 @@ function ExportCallsToSheet(config, period, statusCb) {
       : _parseCallsBatchWindowHoursString_(String(config.callsBatchWindowHours));
     if (co != null) callOpts.windowHours = co;
   }
+  callOpts.onProgress = function(summaryMsg) {
+    if (typeof updateStatusSummary === "function") {
+      updateStatusSummary(summaryMsg);
+    } else if (emit) {
+      emit(summaryMsg);
+    }
+  };
   const rawCalls = GetCallsData(period, emit, callOpts);
   emit(`📞 Телефония: Получено ${rawCalls.length} записей из API`);
 
@@ -177,6 +184,98 @@ function _formatIsoMsk(dateObj) {
   const seconds = ("0" + shifted.getUTCSeconds()).slice(-2);
   return `${year}-${month}-${day}T${hours}:${minutes}:${seconds}+03:00`;
 }
+
+/**
+ * Старт текущих суток по МСК в миллисекундах UTC-эпохи.
+ * @returns {number}
+ * @private
+ */
+function _getTodayStartMsMsk_() {
+  const now = new Date();
+  const mskShiftMs = 3 * 60 * 60 * 1000;
+  const mskNow = new Date(now.getTime() + mskShiftMs);
+  const y = mskNow.getUTCFullYear();
+  const m = mskNow.getUTCMonth();
+  const d = mskNow.getUTCDate();
+  const todayStartMskUtc = Date.UTC(y, m, d, 0, 0, 0) - mskShiftMs;
+  return todayStartMskUtc;
+}
+
+/**
+ * Короткий запрос первого/последнего звонка в диапазоне.
+ * Возвращает первую строку (по CALL_START_DATE ASC/DESC) или null.
+ *
+ * @param {string} fromIso
+ * @param {string} toIso
+ * @param {"ASC"|"DESC"} order
+ * @returns {Object|null}
+ * @private
+ */
+function _fetchBoundaryCall_(fromIso, toIso, order) {
+  const res = CallBitrix("voximplant.statistic.get", {
+    FILTER: {
+      ">=CALL_START_DATE": fromIso,
+      "<CALL_START_DATE": toIso
+    },
+    SORT: "CALL_START_DATE",
+    ORDER: order,
+    start: 0
+  });
+  if (!res || !res.result || !Array.isArray(res.result) || res.result.length === 0) {
+    return null;
+  }
+  return res.result[0] || null;
+}
+
+/**
+ * Грубая оценка объема звонков по разнице ID:
+ * - первый звонок: от периода start (ASC),
+ * - последний: до периода end (DESC),
+ * - если end попадает в "сегодня/будущее" и звонков за сегодня нет, ищем вчера (DESC).
+ *
+ * @param {{start: string, end: string}} period
+ * @returns {{estimated: number|null, firstId: number|null, lastId: number|null}}
+ * @private
+ */
+function _estimateCallsByIdRange_(period) {
+  let first = null;
+  let last = null;
+  try {
+    first = _fetchBoundaryCall_(period.start, period.end, "ASC");
+    if (!first || first.ID == null) {
+      return { estimated: 0, firstId: null, lastId: null };
+    }
+
+    const endMs = new Date(period.end).getTime();
+    const todayStartMs = _getTodayStartMsMsk_();
+
+    // Базово берём последний звонок по всему диапазону.
+    last = _fetchBoundaryCall_(period.start, period.end, "DESC");
+
+    // Если конец периода сегодня/позже и "хвост" пуст, пробуем вчера.
+    if ((!last || last.ID == null) && endMs >= todayStartMs) {
+      const yStartMs = todayStartMs - 24 * 60 * 60 * 1000;
+      const yStartIso = _formatIsoMsk(new Date(yStartMs));
+      const yEndIso = _formatIsoMsk(new Date(todayStartMs));
+      last = _fetchBoundaryCall_(yStartIso, yEndIso, "DESC");
+    }
+
+    const firstId = Number(first.ID);
+    const lastId = last && last.ID != null ? Number(last.ID) : firstId;
+    if (isNaN(firstId) || isNaN(lastId)) {
+      return { estimated: null, firstId: null, lastId: null };
+    }
+    // В voximplant ID звонков в этом портале идут чётным шагом (2),
+    // поэтому оценка по диапазону должна учитывать шаг.
+    const step = (firstId % 2 === 0 && lastId % 2 === 0) ? 2 : 1;
+    const estimated = Math.max(0, Math.floor((lastId - firstId) / step) + 1);
+    return { estimated: estimated, firstId: firstId, lastId: lastId };
+  } catch (e) {
+    console.warn(`⚠ Не удалось оценить объём звонков по ID: ${e.message}`);
+    return { estimated: null, firstId: null, lastId: null };
+  }
+}
+
 
 /**
  * @param {string|number} raw
@@ -298,12 +397,6 @@ function _fetchCallsWindowBatch(windowStartIso, windowEndIso, emit, windowNo, wi
     start += cmdCount * 50;
     batchNo++;
 
-    // Снижаем шум: показываем прогресс батчей только если в окне реально >1 batch.
-    if (emit && batchNo > 1) {
-      const processed = total > 0 ? Math.min(start, total) : collected.length;
-      emit(`📞 Телефония: окно ${windowNo}/${windowsTotal}, батч ${batchNo} (~${cmdCount * 50}) — ${processed}/${total > 0 ? total : collected.length}`);
-    }
-
     if (cmdCount < 50 && Object.keys(resultMap).length < 50) break;
   }
 
@@ -328,6 +421,8 @@ function _fetchCallsWindowBatch(windowStartIso, windowEndIso, emit, windowNo, wi
  */
 function GetCallsData(period, statusCb, options) {
   const emit = typeof statusCb === "function" ? statusCb : null;
+  const emitProgress =
+    options && typeof options.onProgress === "function" ? options.onProgress : null;
   const allCalls = [];
   const seenCallIds = new Set();
   const winArg =
@@ -349,6 +444,16 @@ function GetCallsData(period, statusCb, options) {
   const windowsTotal = Math.max(1, Math.ceil((endMs - startMs) / WINDOW_MS));
   let cursor = startMs;
   let windowNo = 0;
+  let discoveredTotal = 0;
+  const estimate = _estimateCallsByIdRange_(period);
+  const estimatedAdjusted = estimate && estimate.estimated != null ? Number(estimate.estimated) : null;
+  if (emitProgress) {
+    if (estimatedAdjusted != null) {
+      emitProgress(`📞 Телефония: оценка ~${estimatedAdjusted} звонков (по диапазону ID)`);
+    } else {
+      emitProgress(`📞 Телефония: оценка объёма недоступна, начинаю загрузку...`);
+    }
+  }
 
   while (cursor < endMs) {
     windowNo++;
@@ -356,16 +461,9 @@ function GetCallsData(period, statusCb, options) {
     const windowStartIso = _formatIsoMsk(new Date(cursor));
     const windowEndIso = _formatIsoMsk(new Date(windowEnd));
 
-    // Старт окна: не печатать на каждом шаге (30 суток = 30 строк) — как у «окно завершено».
-    const shouldEmitWindowStart =
-      (windowNo === 1) || (windowNo === windowsTotal) || (windowNo % 5 === 0);
-    if (emit && shouldEmitWindowStart) {
-      emit(
-        `📞 Телефония: окно ${windowNo}/${windowsTotal} (${windowSize.hours}ч) ${windowStartIso} → ${windowEndIso}, пакет до 2500 записей`
-      );
-    }
-
     const result = _fetchCallsWindowBatch(windowStartIso, windowEndIso, emit, windowNo, windowsTotal);
+    const windowTotal = Math.max(result.total || 0, result.rows.length || 0);
+    discoveredTotal += windowTotal;
     result.rows.forEach(call => {
       const callId = call && call.ID != null ? String(call.ID) : "";
       if (!callId) return;
@@ -375,10 +473,19 @@ function GetCallsData(period, statusCb, options) {
       }
     });
 
-    // Не спамим статусом по каждому окну: оставляем контрольные точки.
-    const shouldEmitWindowDone = (windowNo === 1) || (windowNo === windowsTotal) || (windowNo % 5 === 0) || (result.batches > 1);
-    if (emit && shouldEmitWindowDone) {
-      emit(`📞 Телефония: окно ${windowNo}/${windowsTotal} завершено, добавлено ${result.rows.length}, всего ${allCalls.length}`);
+    if (emitProgress) {
+      const estimatedTotal = estimatedAdjusted;
+      const liveTotal = discoveredTotal > 0 ? discoveredTotal : allCalls.length;
+      const totalLabel = estimatedTotal != null
+        ? `~${Math.max(estimatedTotal, liveTotal)}`
+        : String(liveTotal);
+      let percentLabel = "";
+      if (estimatedTotal != null && estimatedTotal > 0) {
+        const denominator = Math.max(estimatedTotal, liveTotal);
+        const pct = Math.max(0, Math.min(100, (allCalls.length / denominator) * 100));
+        percentLabel = ` (${pct.toFixed(1)}%)`;
+      }
+      emitProgress(`📞 Телефония: загружено ${allCalls.length}/${totalLabel}${percentLabel}, окно ${windowNo}/${windowsTotal} (${windowSize.hours}ч)`);
     }
 
     cursor = windowEnd;

@@ -4,7 +4,17 @@
     <base target="_top">
     <style>
       body { font-family: 'Segoe UI', sans-serif; background-color: #f8f9fa; margin: 0; padding: 15px; overflow: hidden; }
-      .container { display: flex; align-items: flex-start; gap: 15px; }
+      .container { display: flex; flex-direction: column; height: calc(100vh - 30px); min-height: 0; }
+      #status-bar {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        background: #eef4ff;
+        border: 1px solid #dbe8ff;
+        border-radius: 8px;
+        padding: 8px 10px;
+        margin-bottom: 8px;
+      }
       
       /* Лоадер слева */
       .loader { 
@@ -18,18 +28,51 @@
         width: 0;
         height: 0;
         opacity: 0;
-        margin: 0;
+        margin: 0 -4px 0 0;
         border-width: 0;
         animation: none;
       }
       
-      /* Лог справа - ОБНОВЛЕННЫЙ */
-      #log-container { 
-        flex-grow: 1; 
+      #summary {
+        flex: 1 1 auto;
+        font-size: 12px;
+        font-weight: 600;
+        color: #1f2937;
+        white-space: pre-wrap;
+      }
+      #actions {
+        display: none;
+        margin-bottom: 8px;
+      }
+      #save-log-btn {
+        border: 1px solid #cbd5e1;
+        background: #fff;
+        border-radius: 6px;
+        padding: 6px 10px;
+        font-size: 11px;
+        cursor: pointer;
+      }
+      #save-log-btn[disabled] {
+        opacity: 0.65;
+        cursor: default;
+      }
+      #save-result {
+        margin-top: 6px;
+        font-size: 11px;
+        color: #1e3a8a;
+        white-space: pre-wrap;
+      }
+      #log-container {
+        flex: 1 1 auto;
+        min-height: 0;
+        width: 100%;
+        box-sizing: border-box;
+        background: #f2f4f7;
+        border-radius: 6px;
+        padding: 8px;
         font-size: 11px; 
         color: #333; 
         text-align: left; 
-        max-height: 460px; /* Увеличили высоту прокрутки */
         overflow-y: auto; 
         /* КРИТИЧНО: сохраняем переносы строк \n из нашего лога */
         white-space: pre-wrap; 
@@ -42,53 +85,145 @@
   </head>
   <body>
     <div class="container">
-      <div class="loader" id="spinner"></div>
+      <div id="status-bar">
+        <div class="loader" id="spinner"></div>
+        <div id="summary">Инициализация...</div>
+      </div>
+      <div id="actions">
+        <button id="save-log-btn" type="button">💾 Сохранить отладочный лог</button>
+        <div id="save-result"></div>
+      </div>
       <div id="log-container">Инициализация...</div>
     </div>
  
 <script>
-  // 1. Сразу при открытии ставим статус ожидания
-  document.getElementById('log-container').innerText = "🚀 Запуск...";
+  var usePayloadApi = true;
+  var isDoneLocal = false;
+  var donePollTicks = 0;
+  var saveBtn = document.getElementById("save-log-btn");
+  var saveResult = document.getElementById("save-result");
+  var actions = document.getElementById("actions");
+  var shouldStickToBottom = true;
+  var logContainerRef = document.getElementById("log-container");
 
-  const poll = setInterval(function() {
-    google.script.run.withSuccessHandler(function(statusText) {
-      // Если данных в кэше еще нет, ничего не делаем
-      if (!statusText || statusText === "Подготовка...") {
-        return; 
-      }
-      
-      var logContainer = document.getElementById('log-container');
-      if (logContainer) {
-        logContainer.innerText = statusText;
-        // Прокрутка вниз к последнему сообщению
-        logContainer.scrollTop = logContainer.scrollHeight;
-      }
+  function isNearBottom(el, thresholdPx) {
+    if (!el) return true;
+    var remain = el.scrollHeight - (el.scrollTop + el.clientHeight);
+    return remain <= (thresholdPx || 24);
+  }
 
-      // 3. Завершаем только по финальным статусам.
-      // ⚠️ может быть промежуточным (например, "Найдено новых источников..."), поэтому не стопаемся на нем.
-      const isDone = statusText.indexOf("🏆 Готово!") !== -1 || statusText.indexOf("❌ Ошибка") !== -1;
-      if (isDone) {
-        // Останавливаем опрос сервера (квоты Google не бесконечны)
+  function updateLogTextPreservingScroll(text) {
+    var el = logContainerRef || document.getElementById("log-container");
+    if (!el) return;
+    var wasNearBottom = isNearBottom(el, 28);
+    el.innerText = String(text || "");
+    if (shouldStickToBottom || wasNearBottom) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }
+
+  if (logContainerRef) {
+    logContainerRef.addEventListener("scroll", function() {
+      shouldStickToBottom = isNearBottom(logContainerRef, 28);
+    });
+  }
+
+  function setDoneUi() {
+    if (isDoneLocal) return;
+    isDoneLocal = true;
+    var wrapper = document.querySelector(".container");
+    if (wrapper) wrapper.classList.add("done");
+  }
+
+  function updateByPayload(payload) {
+    if (!payload) return;
+    var summary = payload.summary || "Подготовка...";
+    var log = payload.log || summary;
+    var summaryEl = document.getElementById("summary");
+    var logContainer = document.getElementById("log-container");
+    if (summaryEl) summaryEl.innerText = summary;
+    if (logContainer) updateLogTextPreservingScroll(log || summary);
+    if (payload.done) {
+      setDoneUi();
+      if (payload.canSaveDebugLog) {
+        actions.style.display = "block";
         clearInterval(poll);
-        
-        // Схлопываем лоадер после завершения
-        var wrapper = document.querySelector('.container');
-        if (wrapper) {
-          wrapper.classList.add('done');
+      } else {
+        // syncDebugLogFinishRun_ может прийти в кэш с небольшой задержкой:
+        // держим опрос ещё несколько тиков, чтобы кнопка успела появиться.
+        donePollTicks++;
+        if (donePollTicks >= 8) {
+          clearInterval(poll);
         }
       }
+    }
+  }
+
+  function updateByLegacy(statusText) {
+    if (!statusText || statusText === "Подготовка...") return;
+    var summaryEl = document.getElementById("summary");
+    var logContainer = document.getElementById("log-container");
+    var lines = String(statusText).split("\n");
+    var summary = lines.length ? lines[lines.length - 1] : statusText;
+    if (summaryEl) summaryEl.innerText = summary;
+    if (logContainer) updateLogTextPreservingScroll(statusText);
+    var done = statusText.indexOf("🏆 Готово!") !== -1 || statusText.indexOf("❌ Ошибка") !== -1;
+    if (done) {
+      setDoneUi();
+      donePollTicks++;
+      if (donePollTicks >= 8) {
+        clearInterval(poll);
+      }
+    }
+  }
+
+  const poll = setInterval(function() {
+    var fn = usePayloadApi ? "getProcessingStatusPayload" : "getProcessingStatus";
+    google.script.run.withSuccessHandler(function(result) {
+      if (usePayloadApi) {
+        updateByPayload(result);
+      } else {
+        updateByLegacy(result);
+      }
     }).withFailureHandler(function(err) {
+      if (usePayloadApi) {
+        usePayloadApi = false;
+        return;
+      }
       clearInterval(poll);
-      var logContainer = document.getElementById('log-container');
-      if (logContainer) {
-        logContainer.innerText = "❌ Ошибка получения статуса: " + (err && err.message ? err.message : err);
+      var summaryEl = document.getElementById("summary");
+      var logContainer = document.getElementById("log-container");
+      var text = "❌ Ошибка получения статуса: " + (err && err.message ? err.message : err);
+      if (summaryEl) summaryEl.innerText = text;
+      if (logContainer) logContainer.innerText = text;
+      var wrapper = document.querySelector(".container");
+      if (wrapper) wrapper.classList.add("done");
+    })[fn](); 
+  }, 500);
+
+  saveBtn.addEventListener("click", function() {
+    saveBtn.disabled = true;
+    saveResult.innerText = "Сохраняю...";
+    google.script.run.withSuccessHandler(function(res) {
+      if (res && res.ok) {
+        var link = res.url ? "\n" + res.url : "";
+        saveResult.innerText = "✅ Лог сохранен: " + (res.name || "файл") + link;
+      } else {
+        saveResult.innerText = "⚠️ Не удалось сохранить: " + ((res && res.message) || "неизвестная ошибка");
       }
-      var wrapper = document.querySelector('.container');
-      if (wrapper) {
-        wrapper.classList.add('done');
-      }
-    }).getProcessingStatus(); 
-  }, 500); // Опрос каждые 500 мс (функция getProcessingStatus — в скрипте таблицы, мост к библиотеке)
+      saveBtn.disabled = false;
+      actions.style.display = "none";
+    }).withFailureHandler(function(err) {
+      saveResult.innerText = "❌ Ошибка сохранения: " + (err && err.message ? err.message : err);
+      saveBtn.disabled = false;
+    }).saveProcessingDebugLog();
+  });
+
+  window.addEventListener("beforeunload", function() {
+    if (!isDoneLocal) return;
+    if (actions.style.display !== "block") return;
+    google.script.run.discardProcessingDebugLog();
+  });
 </script>
 
 
